@@ -30,9 +30,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-// #include <thread>
 
-#define INFO_PANEL_WIDTH 16.0f
+#define INFO_PANEL_WIDTH 20.0f
 
 // Load a file. You must free the character array.
 static char* ReadFile( int& size, const char* filename )
@@ -95,7 +94,6 @@ void SampleContext::Save()
 	fprintf( file, "  \"drawShapes\": %s,\n", gd->drawShapes ? "true" : "false" );
 	fprintf( file, "  \"drawJoints\": %s,\n", gd->drawJoints ? "true" : "false" );
 	fprintf( file, "  \"drawContacts\": %s,\n", gd->drawContacts ? "true" : "false" );
-	fprintf( file, "  \"showDiagnostics\": %s,\n", showMetrics ? "true" : "false" );
 	fprintf( file, "  \"enableShadows\": %s,\n", enableShadows ? "true" : "false" );
 	fprintf( file, "  \"enableGtao\": %s,\n", enableGtao ? "true" : "false" );
 	fprintf( file, "  \"gtaoQuality\": %d,\n", gtaoQuality );
@@ -133,6 +131,9 @@ void SampleContext::Load()
 	{
 		return;
 	}
+
+	// Settings file exists, so it is not a new user.
+	newUser = false;
 
 	jsmn_parser parser;
 	jsmntok_t tokens[MAX_TOKENS];
@@ -177,11 +178,6 @@ void SampleContext::Load()
 		{
 			const char* s = data + tokens[i + 1].start;
 			GetGuiDraw()->drawContacts = strncmp( s, "true", 4 ) == 0;
-		}
-		else if ( jsoneq( data, &tokens[i], "showDiagnostics" ) == 0 )
-		{
-			const char* s = data + tokens[i + 1].start;
-			showMetrics = strncmp( s, "true", 4 ) == 0;
 		}
 		else if ( jsoneq( data, &tokens[i], "enableShadows" ) == 0 )
 		{
@@ -1339,6 +1335,25 @@ void SelectSample( SampleContext* context, int selection, bool restart )
 	context->restart = false;
 }
 
+void OpenReplayFileDialog( SampleContext* context )
+{
+	if ( g_replayIndex < 0 )
+	{
+		return;
+	}
+
+	NFD_Init();
+	nfdu8char_t* outPath = nullptr;
+	nfdu8filteritem_t filter[1] = { { "Box3D recording", "b3rec" } };
+	if ( NFD_OpenDialogU8( &outPath, filter, 1, nullptr ) == NFD_OKAY )
+	{
+		snprintf( context->replayFile, sizeof( context->replayFile ), "%s", outPath );
+		NFD_FreePathU8( outPath );
+		SelectSample( context, g_replayIndex, false );
+	}
+	NFD_Quit();
+}
+
 // Subsequence fuzzy match. Returns a score (higher is better) or -1 if the
 // needle is not a subsequence of the haystack. Bonuses for a prefix match, a
 // word start, and a contiguous run, so "stack" ranks Pyramid > Stack sensibly.
@@ -1672,38 +1687,33 @@ static void DrawMenuBar( SampleContext* context )
 		{
 			if ( ImGui::MenuItem( "Open..." ) )
 			{
-				NFD_Init();
-				nfdu8char_t* outPath = nullptr;
-				nfdu8filteritem_t filter[1] = { { "Box3D recording", "b3rec" } };
-				if ( NFD_OpenDialogU8( &outPath, filter, 1, nullptr ) == NFD_OKAY )
-				{
-					snprintf( context->replayFile, sizeof( context->replayFile ), "%s", outPath );
-					NFD_FreePathU8( outPath );
-					SelectSample( context, g_replayIndex, false );
-				}
-				NFD_Quit();
+				// Defer the native picker to the top of the next frame. Running it
+				// here would block on a nested run loop mid-frame (after the buffers
+				// were uploaded and the ImGui frame began), re-entering the render
+				// loop. See OpenReplayFileDialog and SampleContext::openReplayPicker.
+				context->openReplayPicker = true;
 			}
 			ImGui::EndMenu();
 		}
 
-		static bool showHelp = false;
 		static bool showAbout = false;
 		if ( ImGui::BeginMenu( "Help" ) )
 		{
-			ImGui::MenuItem( "Controls", nullptr, &showHelp );
+			ImGui::MenuItem( "Controls", "?", &context->showControls );
 			ImGui::MenuItem( "About", nullptr, &showAbout );
 			ImGui::EndMenu();
 		}
 
 		ImGui::EndMainMenuBar();
 
-		if ( showHelp )
+		if ( context->showControls )
 		{
-			ImGui::SetNextWindowPos( { context->camera.m_width * 0.5f, context->camera.m_height * 0.5f }, ImGuiCond_Appearing,
+			ImGui::SetNextWindowPos( { context->camera.m_width * 0.5f, context->camera.m_height * 0.35f }, ImGuiCond_Appearing,
 									 { 0.5f, 0.5f } );
 			ImGui::SetNextWindowSize( { 26.0f * fontSize, 0.0f }, ImGuiCond_Appearing );
 
-			if ( ImGui::Begin( "Controls", &showHelp, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize ) )
+			if ( ImGui::Begin( "Controls", &context->showControls,
+							   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize ) )
 			{
 				ImGui::SeparatorText( "Keyboard" );
 				if ( ImGui::BeginTable( "keys", 2, ImGuiTableFlags_SizingFixedFit ) )
@@ -1715,17 +1725,21 @@ static void DrawMenuBar( SampleContext* context )
 					DrawRow( "R", "Restart sample" );
 					DrawRow( "[  ]", "Previous / next sample" );
 					DrawRow( "Ctrl+O", "Open sample picker" );
-					DrawRow( "F / Home", "Frame selection / world" );
-					DrawRow( "Esc", "Quit" );
+					DrawRow( "F", "Frame selection / world" );
+					DrawRow( "?", "Show / hide controls" );
+					DrawRow( "Esc", "Cancel / close" );
+					DrawRow( "Ctrl+Q", "Quit" );
 					ImGui::EndTable();
 				}
 
 				ImGui::SeparatorText( "Mouse" );
 				if ( ImGui::BeginTable( "mouse", 2, ImGuiTableFlags_SizingFixedFit ) )
 				{
-					DrawRow( "Left drag", "Move bodies (mouse joint)" );
+					DrawRow( "Left click", "Select body/shape" );
+					DrawRow( "Ctrl + left drag", "Move bodies (mouse joint)" );
 					DrawRow( "Alt + left drag", "Orbit camera" );
 					DrawRow( "Alt + middle drag", "Pan camera" );
+					DrawRow( "Alt + right drag", "Zoom (dolly)" );
 					DrawRow( "Right drag", "Fly look (WASD to move)" );
 					DrawRow( "Scroll", "Zoom" );
 					DrawRow( "Shift + left", "Shoot (Ctrl spin, Alt ragdoll)" );
@@ -1847,6 +1861,13 @@ static void DrawSamplePicker( SampleContext* context )
 			ImGui::CloseCurrentPopup();
 		}
 
+		// The active search field eats the first Esc, so dismiss here instead of
+		// relying on the popup's default nav close.
+		if ( ImGui::IsKeyPressed( ImGuiKey_Escape, false ) )
+		{
+			ImGui::CloseCurrentPopup();
+		}
+
 		ImGui::EndPopup();
 	}
 }
@@ -1869,6 +1890,14 @@ static void DrawInfoPanel( SampleContext* context )
 	ImGui::TextColored( HexColor( b3_colorGoldenRod ), "%s", entry.Name );
 	ImGui::TextColored( HexColor( b3_colorLightGray ), "%s", entry.Category );
 	ImGui::Separator();
+
+	if ( context->pause )
+	{
+		ImGui::TextColored( HexColor( b3_colorRed ), "PAUSED" );
+		ImGui::SameLine();
+		ImGui::TextDisabled( "(p)" );
+		ImGui::Separator();
+	}
 
 	const float frameMs = (float)( sapp_frame_duration() * 1000.0 );
 	ImGui::TextColored( HexColor( b3_colorSeaGreen ), "%.1f ms", frameMs );
@@ -1966,6 +1995,12 @@ static void DrawHud( SampleContext* context )
 	float fontSize = ImGui::GetFontSize();
 
 	DrawScreenStringFormat( 5, (int)( 1.5f * fontSize ), MakeColor( b3_colorYellow ), "%s : %s", entry.Category, entry.Name );
+
+	if ( context->pause )
+	{
+		DrawScreenString( 5, (int)( 3.0f * fontSize ), MakeColor( b3_colorRed ), "****PAUSED****" );
+	}
+
 	DrawScreenStringFormat( 5, context->camera.m_height - (int)( 1.5f * fontSize ), MakeColor( b3_colorSeaGreen ),
 							"%.1f ms  step %d", 1000.0f * (float)sapp_frame_duration(), context->sample->m_stepCount );
 }

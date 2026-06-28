@@ -49,7 +49,21 @@ static int CompareSamples( const void* a, const void* b )
 
 static void SortSamples()
 {
+	// Sorting reorders the table, so recover the replay viewer's slot by identity.
+	SampleCreateFcn* replayFcn = ( g_replayIndex >= 0 ) ? g_sampleEntries[g_replayIndex].CreateFcn : nullptr;
 	qsort( g_sampleEntries, g_sampleCount, sizeof( SampleEntry ), CompareSamples );
+	if ( replayFcn != nullptr )
+	{
+		g_replayIndex = -1;
+		for ( int i = 0; i < g_sampleCount; ++i )
+		{
+			if ( g_sampleEntries[i].CreateFcn == replayFcn )
+			{
+				g_replayIndex = i;
+				break;
+			}
+		}
+	}
 }
 
 // Single host UI callback fired from inside StartUIFrame: menu bar, panels, and
@@ -76,6 +90,9 @@ static void OnInit( void )
 
 	s_context.Load();
 
+	// First run with no settings opens with the controls window up.
+	s_context.showControls = s_context.newUser;
+
 	int cores = (int)std::thread::hardware_concurrency();
 	s_context.workerCount = b3ClampInt( cores / 2, 1, 8 );
 	s_context.windowWidth = sapp_width();
@@ -83,9 +100,15 @@ static void OnInit( void )
 
 	SortSamples();
 
+	// A first run with no settings opens straight into the replay viewer.
+	int index = s_context.sampleIndex;
+	if ( s_context.newUser && g_replayIndex >= 0 )
+	{
+		index = g_replayIndex;
+	}
+
 	// --sample N selects a registered sample by sorted index, overriding the
 	// persisted one. Lets a headless --frames run target a specific sample.
-	int index = s_context.sampleIndex;
 	if ( s_sampleOverride >= 0 && s_sampleOverride < g_sampleCount )
 	{
 		index = s_sampleOverride;
@@ -96,12 +119,11 @@ static void OnInit( void )
 
 static void OnEvent( const sapp_event* e )
 {
-	// Esc quits even with ImGui focus so a text field can't trap the app.
-	if ( e->type == SAPP_EVENTTYPE_KEY_DOWN && e->key_code == SAPP_KEYCODE_ESCAPE )
-	{
-		sapp_request_quit();
-		return;
-	}
+	//if ( e->type == SAPP_EVENTTYPE_KEY_DOWN || e->type == SAPP_EVENTTYPE_CHAR )
+	//{
+	//	volatile int dummy = 0;
+	//	dummy = 32;
+	//}
 
 	bool uiCaptured = false;
 	if (s_context.camera.m_thirdPerson == false)
@@ -142,6 +164,29 @@ static void OnEvent( const sapp_event* e )
 						s_context.showUI = !s_context.showUI;
 						break;
 
+					case KEY_ESCAPE:
+						// Layered cancel. An open picker is an ImGui popup that
+						// already swallowed this. So peel the controls window, then
+						// the selection. Quit lives on Ctrl+Q now.
+						if ( s_context.showControls )
+						{
+							s_context.showControls = false;
+						}
+						else
+						{
+							ClearSelection();
+						}
+						break;
+
+					case KEY_Q:
+						if ( mods & MOD_CTRL )
+						{
+							sapp_request_quit();
+							break;
+						}
+						s_context.sample->Keyboard( e->key_code, ACTION_PRESS, mods );
+						break;
+
 					case KEY_O:
 						if ( mods & MOD_CTRL )
 						{
@@ -156,6 +201,9 @@ static void OnEvent( const sapp_event* e )
 						break;
 
 					case KEY_P:
+						// Pause stays on P. Space is not bound here on purpose. Global
+						// keys are dispatched before the sample sees them, so claiming
+						// Space would steal jump from the Mover sample.
 						s_context.pause = !s_context.pause;
 						break;
 
@@ -176,7 +224,6 @@ static void OnEvent( const sapp_event* e )
 						break;
 
 					case KEY_F:
-					case KEY_HOME:
 					{
 						// Frame the selection, or let the sample frame its whole scene when nothing is
 						// selected. A non-body selection such as a recorded query supplies its own bounds and
@@ -214,6 +261,16 @@ static void OnEvent( const sapp_event* e )
 
 		case SAPP_EVENTTYPE_KEY_UP:
 			SetKeyDown( e->key_code, false );
+			break;
+
+		case SAPP_EVENTTYPE_CHAR:
+			// ? toggles the controls window. Read the typed character so it works
+			// on any layout and a text field can still type a literal ?, since the
+			// picker captures the event before it reaches here.
+			if ( e->char_code == '?' && e->key_repeat == false )
+			{
+				s_context.showControls = !s_context.showControls;
+			}
 			break;
 
 		case SAPP_EVENTTYPE_MOUSE_DOWN:
@@ -294,6 +351,16 @@ static void OnFrame( void )
 		return;
 	}
 
+	// Handle a deferred Replay > Open request before any GPU work this frame.
+	// The native picker blocks on a nested run loop. Running it here (no pass
+	// open, no buffers updated, no ImGui frame begun) keeps it from re-entering
+	// a half-built frame the way it did when invoked from inside the UI callback.
+	if ( s_context.openReplayPicker )
+	{
+		s_context.openReplayPicker = false;
+		OpenReplayFileDialog( &s_context );
+	}
+
 	const float dt = (float)sapp_frame_duration();
 	const int W = sapp_width();
 	const int H = sapp_height();
@@ -320,13 +387,6 @@ static void OnFrame( void )
 	// b3DebugDraw adapter and the sample's own Draw* calls.
 	SetTransparentDynamic( s_context.transparentDynamic );
 	s_context.sample->ResetText();
-
-	// Pause banner only with the UI up, matching Box2D.
-	if ( s_context.pause && s_context.showUI )
-	{
-		s_context.sample->DrawTextLine( "****PAUSED****" );
-		s_context.sample->DrawTextLine( "" );
-	}
 
 	s_context.sample->Step();
 	s_context.sample->Render();
