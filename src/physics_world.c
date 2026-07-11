@@ -1172,12 +1172,19 @@ void b3World_Step( b3WorldId worldId, float timeStep, int subStepCount )
 	b3Array_Clear( world->contactEndEvents[world->endEventArrayIndex] );
 	world->locked = false;
 
+	world->profile.fracture = 0.0f;
+	world->profile.fractureGather = 0.0f;
+	world->profile.fractureAnalyze = 0.0f;
+	world->profile.fractureSever = 0.0f;
+	world->profile.fractureDebris = 0.0f;
 	if ( world->fractureWorld != NULL && timeStep > 0.0f )
 	{
 		struct b3Recording* rec = world->recording;
 		world->recording = NULL;
 		b3FractureWorld_Step( world, timeStep );
 		world->recording = rec;
+
+		world->profile.step += world->profile.fracture;
 	}
 
 	if ( world->recording != NULL )

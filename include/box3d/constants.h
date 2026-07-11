@@ -41,7 +41,7 @@ B3_API float b3GetStallThreshold( void );
 // Maximum number of colors in the constraint graph. Constraints that cannot
 // find a color are added to the overflow set which are solved single-threaded.
 // The compound barrel benchmark has minor overflow with 24 colors
-#define B3_GRAPH_COLOR_COUNT 24
+#define B3_GRAPH_COLOR_COUNT 48
 
 // Number of contact point buckets for counting the number of contact points per
 // shape contact pair. This is just for reporting and doesn't affect simulation.

@@ -211,6 +211,9 @@ public:
 		changed |= ImGui::Checkbox( "Contact stress", &t.contactStress );
 		changed |= ImGui::SliderFloat( "Strength scale", &t.strengthScale, 0.1f, 5.0f, "%.2f" );
 		changed |= ImGui::SliderFloat( "Crack roughness", &t.fractureRoughness, 0.0f, 4.0f, "%.1f" );
+		changed |= ImGui::SliderInt( "Analysis stride", &t.analysisStride, 1, 8 );
+		changed |= ImGui::SliderInt( "Max debris", &t.maxDebris, 0, 5000 );
+		changed |= ImGui::Checkbox( "Parallel analysis (needs workers > 1)", &t.parallelAnalysis );
 		if ( changed )
 		{
 			b3World_SetFractureTuning( m_worldId, t );

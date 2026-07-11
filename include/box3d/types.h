@@ -553,6 +553,11 @@ typedef struct b3Profile
 	float bullets;
 	float sleepIslands;
 	float sensors;
+	float fracture;
+	float fractureGather;
+	float fractureAnalyze;
+	float fractureSever;
+	float fractureDebris;
 } b3Profile;
 
 /// Counters that give details of the simulation size.

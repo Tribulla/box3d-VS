@@ -261,6 +261,135 @@ static int FractureConvexShatters( void )
 	return 0;
 }
 
+static int FractureConvexCantileverSnaps( void )
+{
+	b3WorldId worldId = FractureMakeWorld();
+	FractureMakeGround( worldId );
+	b3BoxHull beam = b3MakeBoxHull( 8.0f, 0.5f, 0.5f );
+	int anchorThresh = -4; // anchor chunks whose local centroid x < -4 (one end of the beam)
+	b3FractureDef def = b3DefaultFractureDef();
+	def.anchor = AnchorLowX;
+	def.anchorContext = &anchorThresh;
+	b3WorldTransform xf = { { 0.0f, 8.0f, 0.0f }, b3Quat_identity };
+	b3World_CreateFractureConvex( worldId, &beam.base, xf, 24, b3GetFractureMaterial( b3_fractureStone ), &def );
+
+	int p0 = b3World_GetFractureBodyCount( worldId );
+	ENSURE( p0 == 1 );
+	bool snapped = false;
+	for ( int s = 0; s < 200 && !snapped; ++s )
+	{
+		FractureStepN( worldId, 1 );
+		if ( b3World_GetFractureBodyCount( worldId ) > p0 )
+			snapped = true;
+		ENSURE( FractureBounded( worldId ) );
+	}
+	ENSURE( snapped );
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+static int FractureStrideCantileverSnaps( void )
+{
+	b3WorldId worldId = FractureMakeWorld();
+	b3FractureTuning t = b3World_GetFractureTuning( worldId );
+	t.analysisStride = 3;
+	b3World_SetFractureTuning( worldId, t );
+	FractureMakeGround( worldId );
+	b3Vec3i cells[26 * 4 * 4];
+	int n = FractureBoxCells( cells, 26, 4, 4, -2, 14, -2 );
+	int anchorThresh = 0;
+	b3FractureDef def = b3DefaultFractureDef();
+	def.anchor = AnchorLowX;
+	def.anchorContext = &anchorThresh;
+	b3World_CreateFractureVoxels( worldId, cells, n, b3GetFractureMaterial( b3_fractureConcrete ), &def );
+
+	int p0 = b3World_GetFractureBodyCount( worldId );
+	bool snapped = false;
+	for ( int s = 0; s < 250 && !snapped; ++s )
+	{
+		FractureStepN( worldId, 1 );
+		if ( b3World_GetFractureBodyCount( worldId ) > p0 )
+			snapped = true;
+		ENSURE( FractureBounded( worldId ) );
+	}
+	ENSURE( snapped );
+	ENSURE( b3World_GetFractureMaxStress( worldId ) >= 0.0f );
+	ENSURE( isfinite( b3World_GetFractureMaxStress( worldId ) ) );
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+static int FractureParallelCantileverSnaps( void )
+{
+	b3WorldDef wd = b3DefaultWorldDef();
+	wd.gravity = ( b3Vec3 ){ 0.0f, -9.81f, 0.0f };
+	wd.workerCount = 4;
+	b3WorldId worldId = b3CreateWorld( &wd );
+	b3World_EnableFracture( worldId, 1.0f, 0.0f );
+	b3FractureTuning t = b3World_GetFractureTuning( worldId );
+	t.parallelAnalysis = true;
+	b3World_SetFractureTuning( worldId, t );
+	FractureMakeGround( worldId );
+
+	b3BoxHull beam = b3MakeBoxHull( 8.0f, 0.5f, 0.5f );
+	int anchorThresh = -4;
+	b3FractureDef def = b3DefaultFractureDef();
+	def.anchor = AnchorLowX;
+	def.anchorContext = &anchorThresh;
+	b3WorldTransform xf = { { 0.0f, 8.0f, 0.0f }, b3Quat_identity };
+	b3World_CreateFractureConvex( worldId, &beam.base, xf, 24, b3GetFractureMaterial( b3_fractureStone ), &def );
+	// and a voxel tower so the parallel path covers both kinds
+	b3Vec3i cells[3 * 8 * 3];
+	int n = FractureBoxCells( cells, 3, 8, 3, 8, 0, 8 );
+	b3World_CreateFractureVoxels( worldId, cells, n, b3GetFractureMaterial( b3_fractureBrick ), NULL );
+
+	int p0 = b3World_GetFractureBodyCount( worldId );
+	ENSURE( p0 == 2 );
+	bool snapped = false;
+	for ( int s = 0; s < 200 && !snapped; ++s )
+	{
+		FractureStepN( worldId, 1 );
+		if ( b3World_GetFractureBodyCount( worldId ) > p0 )
+			snapped = true;
+		ENSURE( FractureBounded( worldId ) );
+	}
+	ENSURE( snapped );
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
+static int FractureDebrisBudget( void )
+{
+	int counts[2] = { 0, 0 };
+	for ( int pass = 0; pass < 2; ++pass )
+	{
+		b3WorldId w = FractureMakeWorld();
+		if ( pass == 1 )
+		{
+			b3FractureTuning t = b3World_GetFractureTuning( w );
+			t.maxDebris = 3;
+			b3World_SetFractureTuning( w, t );
+		}
+		FractureMakeGround( w );
+		b3HullData* hull = b3CreateCylinder( 8.0f, 2.0f, 0.0f, 12 );
+		b3AABB aabb = b3ComputeHullAABB( hull, ( b3Transform ){ b3Vec3_zero, b3Quat_identity } );
+		b3WorldTransform xf = { { 0.0f, -aabb.lowerBound.y, 0.0f }, b3Quat_identity };
+		b3World_CreateFractureConvex( w, hull, xf, 24, b3GetFractureMaterial( b3_fractureStone ), NULL );
+		b3DestroyHull( hull );
+
+		FractureStepN( w, 40 );
+		FractureFireBall( w, ( b3Vec3 ){ 0.0f, 4.0f, 18.0f }, ( b3Vec3 ){ 0.0f, 0.0f, -110.0f }, 0.5f );
+		FractureStepN( w, 150 );
+		counts[pass] = b3World_GetFractureBodyCount( w );
+		ENSURE( FractureBounded( w ) );
+		b3DestroyWorld( w );
+	}
+	ENSURE( counts[0] > 1 );		   // it shattered
+	ENSURE( counts[1] < counts[0] ); // the cap removed rubble
+	ENSURE( counts[1] >= 1 );
+	return 0;
+}
+
 static int FractureConvertBody( void )
 {
 	b3WorldId worldId = FractureMakeWorld();
@@ -438,7 +567,7 @@ static int FractureConvertPreservesGravityScale( void )
 		if ( b3Body_GetType( c.ids[i] ) == b3_dynamicBody )
 		{
 			dyn++;
-			float y = b3Body_GetWorldCenterOfMass( c.ids[i] ).y;
+			float y = b3Body_GetWorldCenter( c.ids[i] ).y;
 			if ( y < minY )
 				minY = y;
 			float ang = b3Length( b3Body_GetAngularVelocity( c.ids[i] ) );
@@ -485,7 +614,7 @@ static int FractureConvertCompound( void )
 
 	FractureStepN( w, 60 );
 	ENSURE( b3World_GetFractureBodyCount( w ) == 1 );		   // stays whole while intact
-	ENSURE( b3Body_GetWorldCenterOfMass( conv ).y > 3.0f );	   // still floating (gravityScale kept)
+	ENSURE( b3Body_GetWorldCenter( conv ).y > 3.0f );	   // still floating (gravityScale kept)
 
 	FractureFireBall( w, ( b3Vec3 ){ 0.0f, 4.0f, 12.0f }, ( b3Vec3 ){ 0.0f, 0.0f, -140.0f }, 0.5f );
 	FractureStepN( w, 120 );
@@ -495,10 +624,42 @@ static int FractureConvertCompound( void )
 	return 0;
 }
 
+static int FractureDynamicSpanSnapsUnderSelfWeight( void )
+{
+	b3WorldId worldId = FractureMakeWorld();
+	FractureMakeGround( worldId );
+	b3FractureTuning t = b3World_GetFractureTuning( worldId );
+	t.strengthScale = 0.2f; // weak enough that self-weight bending exceeds the span's strength
+	b3World_SetFractureTuning( worldId, t );
+	b3FractureMaterial stone = b3GetFractureMaterial( b3_fractureStone );
+	b3FractureMaterial concrete = b3GetFractureMaterial( b3_fractureConcrete );
+	b3World_CreateFractureBox( worldId, ( b3Vec3 ){ -9.0f, 3.0f, 0.0f }, ( b3Vec3 ){ 2.0f, 3.0f, 4.0f }, stone, NULL );
+	b3World_CreateFractureBox( worldId, ( b3Vec3 ){ 9.0f, 3.0f, 0.0f }, ( b3Vec3 ){ 2.0f, 3.0f, 4.0f }, stone, NULL );
+	b3World_CreateFractureBox( worldId, ( b3Vec3 ){ 0.0f, 7.0f, 0.0f }, ( b3Vec3 ){ 12.0f, 1.0f, 4.0f }, concrete, NULL );
+
+	int p0 = b3World_GetFractureBodyCount( worldId );
+	bool snapped = false;
+	for ( int s = 0; s < 200 && !snapped; ++s )
+	{
+		FractureStepN( worldId, 1 );
+		if ( b3World_GetFractureBodyCount( worldId ) > p0 )
+			snapped = true;
+		ENSURE( FractureBounded( worldId ) );
+	}
+	ENSURE( snapped ); // static self-weight stress fractured a settled dynamic body
+	b3DestroyWorld( worldId );
+	return 0;
+}
+
 int FractureTest( void )
 {
 	RUN_SUBTEST( FractureConvexRests );
 	RUN_SUBTEST( FractureConvexShatters );
+	RUN_SUBTEST( FractureConvexCantileverSnaps );
+	RUN_SUBTEST( FractureDynamicSpanSnapsUnderSelfWeight );
+	RUN_SUBTEST( FractureStrideCantileverSnaps );
+	RUN_SUBTEST( FractureParallelCantileverSnaps );
+	RUN_SUBTEST( FractureDebrisBudget );
 	RUN_SUBTEST( FractureConvertBody );
 	RUN_SUBTEST( FractureRestAndShatter );
 	RUN_SUBTEST( FractureCantileverSnaps );

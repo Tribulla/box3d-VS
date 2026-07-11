@@ -156,6 +156,8 @@ void InitUI( const sg_environment* env, DrawUiFcn* drawGuiFcn )
 	ImGuiIO& io = ImGui::GetIO();
 	io.Fonts->Clear();
 
+	io.ConfigWindowsResizeFromEdges = true;
+
 	// Restyle before the hi-DPI branch: guiApplyStyle sets base metrics, then
 	// ScaleAllSizes (below) multiplies them up. Colors are unscaled.
 	guiApplyStyle();
