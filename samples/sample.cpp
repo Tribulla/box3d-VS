@@ -94,8 +94,6 @@ void SampleContext::Save()
 	fprintf( file, "{\n" );
 	fprintf( file, "  \"sampleIndex\": %d,\n", sampleIndex );
 	fprintf( file, "  \"drawShapes\": %s,\n", gd->drawShapes ? "true" : "false" );
-	fprintf( file, "  \"drawJoints\": %s,\n", gd->drawJoints ? "true" : "false" );
-	fprintf( file, "  \"drawContacts\": %s,\n", gd->drawContacts ? "true" : "false" );
 	fprintf( file, "  \"enableShadows\": %s,\n", enableShadows ? "true" : "false" );
 	fprintf( file, "  \"enableGtao\": %s,\n", enableGtao ? "true" : "false" );
 	fprintf( file, "  \"gtaoQuality\": %d,\n", gtaoQuality );
@@ -171,16 +169,6 @@ void SampleContext::Load()
 		{
 			const char* s = data + tokens[i + 1].start;
 			GetGuiDraw()->drawShapes = strncmp( s, "true", 4 ) == 0;
-		}
-		else if ( jsoneq( data, &tokens[i], "drawJoints" ) == 0 )
-		{
-			const char* s = data + tokens[i + 1].start;
-			GetGuiDraw()->drawJoints = strncmp( s, "true", 4 ) == 0;
-		}
-		else if ( jsoneq( data, &tokens[i], "drawContacts" ) == 0 )
-		{
-			const char* s = data + tokens[i + 1].start;
-			GetGuiDraw()->drawContacts = strncmp( s, "true", 4 ) == 0;
 		}
 		else if ( jsoneq( data, &tokens[i], "enableShadows" ) == 0 )
 		{
@@ -1661,6 +1649,7 @@ static void DrawMenuBar( SampleContext* context )
 			ImGui::MenuItem( "Joint Extras", nullptr, &gd->drawJointExtras );
 			ImGui::MenuItem( "Bounds", nullptr, &gd->drawBounds );
 			ImGui::MenuItem( "Mass", nullptr, &gd->drawMass );
+			ImGui::MenuItem( "Sleep", nullptr, &gd->drawSleep );
 			ImGui::MenuItem( "Body Names", nullptr, &gd->drawBodyNames );
 			ImGui::MenuItem( "Graph Colors", nullptr, &gd->drawGraphColors );
 			ImGui::MenuItem( "Islands", nullptr, &gd->drawIslands );
@@ -2325,7 +2314,7 @@ void CharacterMover::SolveMove( float timeStep, b3Vec3 forward, b3Vec3 right, b3
 		float invMassB = b3Body_GetInverseMass( bodyId );
 		b3Matrix3 invIB = b3Body_GetWorldInverseRotationalInertia( bodyId );
 
-		b3Pos pB = b3Body_GetWorldCenterOfMass( bodyId );
+		b3Pos pB = b3Body_GetWorldCenter( bodyId );
 		b3Vec3 rB = b3SubPos( point, pB );
 
 		b3Vec3 rnB = b3Cross( rB, normal );

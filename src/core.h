@@ -108,6 +108,9 @@ typedef struct b3AtomicU32
 	uint32_t value;
 } b3AtomicU32;
 
+// Minimum memory alignment used for all allocations
+#define B3_ALIGNMENT 16
+
 // Returns the number of elements of an array
 #define B3_ARRAY_COUNT( A ) (int)( sizeof( A ) / sizeof( A[0] ) )
 
@@ -155,8 +158,4 @@ typedef struct b3Thread b3Thread;
 b3Thread* b3CreateThread( b3ThreadFunction* function, void* context, const char* name );
 void b3JoinThread( b3Thread* t );
 
-// Dump to a file. Only one dump file allowed at a time.
-void b3OpenDump( const char* fileName );
-void b3Dump( const char* string, ... );
-void b3CloseDump( void );
-int b3FetchAddMeshDumpIndex( void );
+void b3StrCpy( char* dst, int size, const char* src );

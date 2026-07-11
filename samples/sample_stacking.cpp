@@ -6,9 +6,10 @@
 #include "imgui.h"
 #include "mesh_loader.h"
 #include "sample.h"
-#include "gfx/draw.h"
 
 #include "box3d/box3d.h"
+
+#include <stdio.h>
 
 class CardHouseThick : public Sample
 {
@@ -451,7 +452,9 @@ public:
 
 			b3ShapeDef shapeDef = b3DefaultShapeDef();
 			shapeDef.baseMaterial.rollingResistance = 0.1f;
-
+			char buffer[16];
+			snprintf( buffer, sizeof( buffer ), "box_%.3d", i );
+			shapeDef.name = buffer;
 			b3CreateHullShape( bodyId, &shapeDef, &cube.base );
 		}
 
@@ -573,7 +576,7 @@ public:
 	{
 		if ( m_context->restart == false )
 		{
-			if (m_isDebug)
+			if ( m_isDebug )
 			{
 				m_camera->SetView( 0.0f, 15.0f, 25.0f, b3Pos_zero );
 			}

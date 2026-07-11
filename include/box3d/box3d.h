@@ -246,13 +246,6 @@ B3_API void b3World_RebuildStaticTree( b3WorldId worldId );
 /// This is for internal testing
 B3_API void b3World_EnableSpeculative( b3WorldId worldId, bool flag );
 
-/// Dump world to a text file. Saves only awake bodies and associated static bodies.
-/// Meshes are saved to binary b3m files.
-B3_API void b3World_DumpAwake( b3WorldId worldId );
-
-/// Dump world to a text file. Meshes are saved to binary b3m files.
-B3_API void b3World_Dump( b3WorldId worldId );
-
 /**
  * @defgroup recording Recording
  * @brief Record and replay world state for debugging.
@@ -509,10 +502,10 @@ B3_API b3BodyType b3Body_GetType( b3BodyId bodyId );
 /// properties regardless of the automatic mass setting.
 B3_API void b3Body_SetType( b3BodyId bodyId, b3BodyType type );
 
-/// Set the body name. Up to B3_BODY_NAME_LENGTH characters including null termination.
+/// Set the body name.
 B3_API void b3Body_SetName( b3BodyId bodyId, const char* name );
 
-/// Get the body name.
+/// Get the body name. Returns an empty string if the name isn't set.
 B3_API const char* b3Body_GetName( b3BodyId bodyId );
 
 /// Set the user data for a body
@@ -637,10 +630,10 @@ B3_API float b3Body_GetInverseMass( b3BodyId bodyId );
 B3_API b3Matrix3 b3Body_GetWorldInverseRotationalInertia( b3BodyId bodyId );
 
 /// Get the center of mass position of the body in local space
-B3_API b3Vec3 b3Body_GetLocalCenterOfMass( b3BodyId bodyId );
+B3_API b3Vec3 b3Body_GetLocalCenter( b3BodyId bodyId );
 
 /// Get the center of mass position of the body in world space
-B3_API b3Pos b3Body_GetWorldCenterOfMass( b3BodyId bodyId );
+B3_API b3Pos b3Body_GetWorldCenter( b3BodyId bodyId );
 
 /// Override the body's mass properties. Normally this is computed automatically using the
 /// shape geometry and density. This information is lost if a shape is added or removed or if the
@@ -730,7 +723,7 @@ B3_API bool b3Body_IsContactRecyclingEnabled( b3BodyId bodyId );
 
 /// Enable/disable hit events on all shapes
 /// @see b3ShapeDef::enableHitEvents
-B3_API void b3Body_EnableHitEvents( b3BodyId bodyId, bool enableHitEvents );
+B3_API void b3Body_EnableHitEvents( b3BodyId bodyId, bool flag );
 
 /// Get the world that owns this body
 B3_API b3WorldId b3Body_GetWorld( b3BodyId bodyId );
@@ -846,6 +839,12 @@ B3_API b3WorldId b3Shape_GetWorld( b3ShapeId shapeId );
 
 /// Returns true if the shape is a sensor
 B3_API bool b3Shape_IsSensor( b3ShapeId shapeId );
+
+/// Set the shape name.
+B3_API void b3Shape_SetName( b3ShapeId shapeId, const char* name );
+
+/// Get the shape name. Returns an empty string if the name isn't set.
+B3_API const char* b3Shape_GetName( b3ShapeId shapeId );
 
 /// Set the user data for a shape
 B3_API void b3Shape_SetUserData( b3ShapeId shapeId, void* userData );

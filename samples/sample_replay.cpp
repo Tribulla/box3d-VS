@@ -11,6 +11,7 @@
 
 #include <ctype.h>
 #include <float.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -179,7 +180,7 @@ static void FormatQueryLabel( char* out, int cap, const char* name, uint64_t id,
 {
 	if ( name != nullptr && id != 0 )
 	{
-		snprintf( out, cap, "%s (%llu)", name, (unsigned long long)id );
+		snprintf( out, cap, "%s (%" PRIu64 ")", name, id );
 	}
 	else if ( name != nullptr )
 	{
@@ -187,7 +188,7 @@ static void FormatQueryLabel( char* out, int cap, const char* name, uint64_t id,
 	}
 	else if ( id != 0 )
 	{
-		snprintf( out, cap, "#%llu", (unsigned long long)id );
+		snprintf( out, cap, "#%" PRIu64, id );
 	}
 	else
 	{
@@ -778,9 +779,9 @@ public:
 			ImGui::TextColored( PanelColor( b3_colorRed ), "****DIVERGED****" );
 		}
 
-		const char* phaseTag = b3RecPlayer_IsAtEnd( m_player )		? "  (end)"
+		const char* phaseTag = b3RecPlayer_IsAtEnd( m_player )		 ? "  (end)"
 							   : b3RecPlayer_IsAtPreStep( m_player ) ? "  (pre-step)"
-																	: "";
+																	 : "";
 		ImGui::TextDisabled( "Frame %d / %d%s", b3RecPlayer_GetFrame( m_player ), m_info.frameCount, phaseTag );
 
 		// Selection detail lives here in the info panel, not the Outline window, so the scene tree gets
@@ -938,7 +939,7 @@ public:
 		int count = b3Body_GetContactData( body, contacts, capacity );
 		for ( int i = 0; i < count; ++i )
 		{
-			b3Pos originA = b3Body_GetWorldCenterOfMass( b3Shape_GetBody( contacts[i].shapeIdA ) );
+			b3Pos originA = b3Body_GetWorldCenter( b3Shape_GetBody( contacts[i].shapeIdA ) );
 			for ( int m = 0; m < contacts[i].manifoldCount; ++m )
 			{
 				const b3Manifold* manifold = &contacts[i].manifolds[m];
@@ -965,7 +966,7 @@ public:
 			}
 			b3BodyId body = b3Shape_GetBody( shape );
 			DrawAxes( b3Body_GetTransform( body ), 0.5f );
-			DrawPoint( b3Body_GetWorldCenterOfMass( body ), 8.0f, MakeColor( b3_colorYellow ) );
+			DrawPoint( b3Body_GetWorldCenter( body ), 8.0f, MakeColor( b3_colorYellow ) );
 			DrawBodyContacts( body );
 		}
 		else if ( m_selKind == SelBody )
@@ -976,7 +977,7 @@ public:
 				return;
 			}
 			DrawAxes( b3Body_GetTransform( body ), 0.5f );
-			DrawPoint( b3Body_GetWorldCenterOfMass( body ), 8.0f, MakeColor( b3_colorYellow ) );
+			DrawPoint( b3Body_GetWorldCenter( body ), 8.0f, MakeColor( b3_colorYellow ) );
 			DrawBodyContacts( body );
 		}
 		else if ( m_selKind == SelJoint )
@@ -990,11 +991,11 @@ public:
 			b3BodyId b = b3Joint_GetBodyB( joint );
 			if ( b3Body_IsValid( a ) )
 			{
-				DrawPoint( b3Body_GetWorldCenterOfMass( a ), 8.0f, MakeColor( b3_colorMagenta ) );
+				DrawPoint( b3Body_GetWorldCenter( a ), 8.0f, MakeColor( b3_colorMagenta ) );
 			}
 			if ( b3Body_IsValid( b ) )
 			{
-				DrawPoint( b3Body_GetWorldCenterOfMass( b ), 8.0f, MakeColor( b3_colorMagenta ) );
+				DrawPoint( b3Body_GetWorldCenter( b ), 8.0f, MakeColor( b3_colorMagenta ) );
 			}
 		}
 	}
@@ -1141,8 +1142,8 @@ public:
 			char base[64];
 			FormatQueryLabel( base, sizeof( base ), row.name, row.id, row.type, row.kindOrdinal );
 			char text[112];
-			snprintf( text, sizeof( text ), "f%-5d %s  (%d)  cat 0x%llx", row.frame, base, row.hitCount,
-					  (unsigned long long)row.filter.categoryBits );
+			snprintf( text, sizeof( text ), "f%-5d %s  (%d)  cat 0x%" PRIx64, row.frame, base, row.hitCount,
+					  row.filter.categoryBits );
 			if ( ContainsNoCase( text, m_querySearch ) == false )
 			{
 				continue;
@@ -1197,8 +1198,8 @@ public:
 		int count = b3RecPlayer_GetBodyCount( m_player );
 		for ( int ord = 0; ord < count; ++ord )
 		{
-			b3BodyId body = b3RecPlayer_GetBodyId( m_player, ord );
-			if ( B3_IS_NULL( body ) || b3Body_IsValid( body ) == false )
+			b3BodyId bodyId = b3RecPlayer_GetBodyId( m_player, ord );
+			if ( B3_IS_NULL( bodyId ) || b3Body_IsValid( bodyId ) == false )
 			{
 				continue;
 			}
@@ -1206,10 +1207,15 @@ public:
 			bool ownsSelection =
 				m_selBodyOrdinal == ord && ( m_selKind == SelBody || m_selKind == SelShape || m_selKind == SelJoint );
 
-			const char* name = b3Body_GetName( body );
+			const char* bodyName = b3Body_GetName( bodyId );
+			if ( bodyName == nullptr || bodyName[0] == 0 )
+			{
+				b3BodyType bodyType = b3Body_GetType( bodyId );
+				bodyName = ReplayBodyTypeName( bodyType );
+			}
+
 			char label[64];
-			snprintf( label, sizeof( label ), "Body %d  %s###b%d", ord,
-					  ( name != nullptr && name[0] != '\0' ) ? name : ReplayBodyTypeName( b3Body_GetType( body ) ), ord );
+			snprintf( label, sizeof( label ), "Body %d  %s###b%d", ord, bodyName, ord );
 
 			ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
 			if ( m_selKind == SelBody && m_selBodyOrdinal == ord )
@@ -1237,12 +1243,17 @@ public:
 				continue;
 			}
 
-			BodyShapes( m_shapeBuffer, body );
+			BodyShapes( m_shapeBuffer, bodyId );
 			for ( int s = 0; s < (int)m_shapeBuffer.size(); ++s )
 			{
-				b3ShapeType shapeType = b3Shape_GetType( m_shapeBuffer[s] );
+				const char* shapeName = b3Shape_GetName( m_shapeBuffer[s] );
+				if ( shapeName == nullptr || shapeName[0] == 0 )
+				{
+					b3ShapeType shapeType = b3Shape_GetType( m_shapeBuffer[s] );
+					shapeName = ReplayShapeTypeName( shapeType );
+				}
 				char sl[64];
-				snprintf( sl, sizeof( sl ), "Shape %d  %s###b%ds%d", s, ReplayShapeTypeName( shapeType ), ord, s );
+				snprintf( sl, sizeof( sl ), "Shape %d  %s###b%ds%d", s, shapeName, ord, s );
 				ImGuiTreeNodeFlags lf =
 					ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_NoTreePushOnOpen;
 				if ( m_selKind == SelShape && m_selBodyOrdinal == ord && m_selSlot == s )
@@ -1263,7 +1274,7 @@ public:
 			}
 
 			b3JointId joints[16];
-			int jn = b3Body_GetJoints( body, joints, 16 );
+			int jn = b3Body_GetJoints( bodyId, joints, 16 );
 			for ( int j = 0; j < jn; ++j )
 			{
 				char jl[64];
@@ -1439,8 +1450,8 @@ public:
 		ImGui::Text( "id      %d", shape.index1 );
 		ImGui::Text( "type     %s", ReplayShapeTypeName( b3Shape_GetType( shape ) ) );
 		b3Filter f = b3Shape_GetFilter( shape );
-		ImGui::Text( "category 0x%016llx", (unsigned long long)f.categoryBits );
-		ImGui::Text( "mask     0x%016llx", (unsigned long long)f.maskBits );
+		ImGui::Text( "category 0x%016" PRIx64, f.categoryBits );
+		ImGui::Text( "mask     0x%016" PRIx64, f.maskBits );
 		ImGui::Text( "group    %d", f.groupIndex );
 		ImGui::Text( "density  %.3g", b3Shape_GetDensity( shape ) );
 		ImGui::Text( "friction %.3g", b3Shape_GetFriction( shape ) );
@@ -1547,7 +1558,7 @@ public:
 		}
 		if ( q.id != 0 )
 		{
-			ImGui::Text( "id       %llu", (unsigned long long)q.id );
+			ImGui::Text( "id       %" PRIu64, q.id );
 		}
 		if ( q.key != 0 )
 		{
@@ -1557,8 +1568,8 @@ public:
 		{
 			ImGui::Text( "type     %s #%d", ReplayQueryTypeName( q.type ), m_selQueryKindOrdinal );
 		}
-		ImGui::Text( "category 0x%016llx", (unsigned long long)q.filter.categoryBits );
-		ImGui::Text( "mask     0x%016llx", (unsigned long long)q.filter.maskBits );
+		ImGui::Text( "category 0x%016" PRIx64, q.filter.categoryBits );
+		ImGui::Text( "mask     0x%016" PRIx64, q.filter.maskBits );
 		if ( q.type != b3_recQueryOverlapAABB )
 		{
 			ImGui::Text( "origin   (%.2f, %.2f, %.2f)", q.origin.x, q.origin.y, q.origin.z );

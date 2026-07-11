@@ -334,26 +334,110 @@ public:
 		bodyDef.type = b3_dynamicBody;
 		bodyDef.position = { 0.0f, 2.0f, 0.0f };
 		bodyDef.rotation = b3MakeQuatFromAxisAngle( b3Vec3_axisX, -0.5f * B3_PI );
-		bodyDef.angularVelocity = { 0.01f, 0.01f, 10.0f };
 		bodyDef.gravityScale = 0.0f;
-		b3BodyId bodyId = b3CreateBody( m_worldId, &bodyDef );
+		m_bodyId = b3CreateBody( m_worldId, &bodyDef );
 
 		b3ShapeDef shapeDef = b3DefaultShapeDef();
+		shapeDef.updateBodyMass = false;
 		b3HullData* cylinder = b3CreateCylinder( 0.6f, 0.15f, 0.0f, 32 );
 		b3BoxHull box = b3MakeBoxHull( 1.0f, 0.05f, 0.1f );
-		b3CreateHullShape( bodyId, &shapeDef, cylinder );
-		b3CreateHullShape( bodyId, &shapeDef, &box.base );
+		b3CreateHullShape( m_bodyId, &shapeDef, cylinder );
+		b3CreateHullShape( m_bodyId, &shapeDef, &box.base );
+		b3Body_ApplyMassFromShapes( m_bodyId );
+
+		// Set the angular velocity after creating the shapes and the local center of mass is fixed.
+		b3Body_SetAngularVelocity( m_bodyId, { 0.01f, 0.01f, 10.0f } );
 
 		b3DestroyHull( cylinder );
+	}
+
+	void Step() override
+	{
+		Sample::Step();
+
+		b3Pos c = b3Body_GetWorldCenter( m_bodyId );
+		DrawTextLine( "center %.3g %.3g %.3g", c.x, c.y, c.z );
 	}
 
 	static Sample* Create( SampleContext* sampleContext )
 	{
 		return new GyroscopicTorque( sampleContext );
 	}
+
+	b3BodyId m_bodyId;
 };
 
 static int sampleGyroscopicTorque = RegisterSample( "Bodies", "Gyroscopic Torque", GyroscopicTorque::Create );
+
+// Spinning tops. Ported from PEEL.
+// Each top is tilted and spun about the world up axis. Offsetting the spin axis from the
+// symmetry axis is what makes them precess under gravity instead of spinning true.
+// todo disabling this until issue #65 is fixed
+#if 0
+class GyroscopicPrecession : public Sample
+{
+public:
+	explicit GyroscopicPrecession( SampleContext* context )
+		: Sample( context )
+	{
+		if ( context->restart == false )
+		{
+			m_camera->SetView( 40.0f, 30.0f, 75.0f, { 0.0f, 2.0f, 0.0f } );
+		}
+
+		AddGroundBox( 40.0f );
+
+		// Top shape: a wide n-gon rim up top and a point at the origin, so it balances on its tip.
+		constexpr int numSegs = 7;
+		constexpr float r = 2.0f;
+		constexpr float h = 2.0f;
+		b3Vec3 hullPoints[numSegs + 1];
+		const float dphi = 2.0f * B3_PI / numSegs;
+		for ( int i = 0; i < numSegs; ++i )
+		{
+			hullPoints[i] = { r * cosf( i * dphi ), h, r * sinf( i * dphi ) };
+		}
+		hullPoints[numSegs] = b3Vec3_zero;
+		b3HullData* hull = b3CreateHull( hullPoints, numSegs + 1, numSegs + 1 );
+
+		b3ShapeDef shapeDef = b3DefaultShapeDef();
+
+		// Tilt the symmetry axis, then spin about the world up axis so the offset drives precession.
+		b3Quat rotation = b3MakeQuatFromAxisAngle( b3Vec3_axisZ, 15.0f * B3_PI / 180.0f );
+		b3Vec3 angularVelocity = b3RotateVector( rotation, { 0.0f, 75.0f, 0.0f } );
+
+		constexpr int count = 8;
+		constexpr float separation = 6.0f;
+		for ( int x = 0; x < count; ++x )
+		{
+			for ( int z = 0; z < count; ++z )
+			{
+				b3BodyDef bodyDef = b3DefaultBodyDef();
+				bodyDef.type = b3_dynamicBody;
+				bodyDef.position = { ( x - count / 2 ) * separation, h, ( z - count / 2 ) * separation };
+				bodyDef.rotation = rotation;
+
+				// The spin rate exceeds the default cap, so bypass it as the test intends.
+				bodyDef.allowFastRotation = true;
+
+				b3BodyId bodyId = b3CreateBody( m_worldId, &bodyDef );
+				b3CreateHullShape( bodyId, &shapeDef, hull );
+
+				b3Body_SetAngularVelocity( bodyId, angularVelocity );
+			}
+		}
+
+		b3DestroyHull( hull );
+	}
+
+	static Sample* Create( SampleContext* context )
+	{
+		return new GyroscopicPrecession( context );
+	}
+};
+
+static int sampleGyroscopicPrecession = RegisterSample( "Bodies", "Gyroscopic Precession", GyroscopicPrecession::Create );
+#endif
 
 class Weeble : public Sample
 {
@@ -631,7 +715,7 @@ public:
 		{
 			PickRay pickRay = m_camera->BuildPickRay( p.x, p.y );
 			b3Pos origin = pickRay.origin + 10.0f * b3Normalize( pickRay.translation );
-			m_transform.p = m_baseTranslation + b3SubPos(origin, m_origin);
+			m_transform.p = m_baseTranslation + b3SubPos( origin, m_origin );
 		}
 	}
 
