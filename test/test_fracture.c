@@ -411,6 +411,73 @@ static int FractureConvertPreservesMass( void )
 	return 0;
 }
 
+static int FractureConvertPreservesGravityScale( void )
+{
+	b3WorldId w = FractureMakeWorld();
+	FractureMakeGround( w );
+
+	b3BoxHull box = b3MakeBoxHull( 0.35f, 0.08f, 0.5f ); // a "book"
+	b3BodyDef bd = b3DefaultBodyDef();
+	bd.type = b3_dynamicBody;
+	bd.position = ( b3Pos ){ 0.0f, 5.0f, 0.0f };
+	bd.gravityScale = 0.0f;						  // floats
+	bd.angularVelocity = ( b3Vec3 ){ 0.01f, 5.0f, 0.01f }; // spinning
+	b3BodyId body = b3CreateBody( w, &bd );
+	b3ShapeDef sd = b3DefaultShapeDef();
+	b3CreateHullShape( body, &sd, &box.base );
+
+	b3World_MakeBodyFracture( w, body, b3GetFractureMaterial( b3_fractureStone ), NULL );
+	FractureStepN( w, 120 ); // 2 seconds; would fall ~20 m under gravity if gravityScale were lost
+
+	DomCollect c = { 0 };
+	b3AABB huge = { { -1.0e4f, -1.0e4f, -1.0e4f }, { 1.0e4f, 1.0e4f, 1.0e4f } };
+	b3World_OverlapAABB( w, huge, b3DefaultQueryFilter(), CollectBodiesCb, &c );
+	int dyn = 0;
+	float minY = 1.0e9f, maxAng = 0.0f;
+	for ( int i = 0; i < c.count; ++i )
+		if ( b3Body_GetType( c.ids[i] ) == b3_dynamicBody )
+		{
+			dyn++;
+			float y = b3Body_GetWorldCenterOfMass( c.ids[i] ).y;
+			if ( y < minY )
+				minY = y;
+			float ang = b3Length( b3Body_GetAngularVelocity( c.ids[i] ) );
+			if ( ang > maxAng )
+				maxAng = ang;
+		}
+	ENSURE( dyn >= 1 );
+	ENSURE( minY > 4.0f );	// still floating near y = 5, not fallen to the ground
+	ENSURE( maxAng > 1.0f ); // still spinning (angular velocity preserved too)
+	b3DestroyWorld( w );
+	return 0;
+}
+
+static int FractureConvertSkipsCompound( void )
+{
+	b3WorldId w = FractureMakeWorld();
+	FractureMakeGround( w );
+
+	b3BodyDef bd = b3DefaultBodyDef();
+	bd.type = b3_dynamicBody;
+	bd.position = ( b3Pos ){ 0.0f, 3.0f, 0.0f };
+	bd.gravityScale = 0.0f;
+	b3BodyId body = b3CreateBody( w, &bd );
+	b3ShapeDef sd = b3DefaultShapeDef();
+	b3HullData* cyl = b3CreateCylinder( 0.6f, 0.15f, 0.0f, 16 );
+	b3BoxHull box = b3MakeBoxHull( 1.0f, 0.05f, 0.1f );
+	b3CreateHullShape( body, &sd, cyl );
+	b3CreateHullShape( body, &sd, &box.base );
+	b3DestroyHull( cyl );
+	ENSURE( b3Body_GetShapeCount( body ) == 2 );
+
+	int piece = b3World_MakeBodyFracture( w, body, b3GetFractureMaterial( b3_fractureStone ), NULL );
+	ENSURE( piece < 0 );						 // compound body was skipped, not converted
+	ENSURE( b3Body_IsValid( body ) );			 // original left intact...
+	ENSURE( b3Body_GetShapeCount( body ) == 2 ); // ...with BOTH shapes still present
+	b3DestroyWorld( w );
+	return 0;
+}
+
 int FractureTest( void )
 {
 	RUN_SUBTEST( FractureConvexRests );
@@ -424,5 +491,7 @@ int FractureTest( void )
 	RUN_SUBTEST( FractureBridgeHoldsThenBreaks );
 	RUN_SUBTEST( FractureDestructibleDominoesTopple );
 	RUN_SUBTEST( FractureConvertPreservesMass );
+	RUN_SUBTEST( FractureConvertPreservesGravityScale );
+	RUN_SUBTEST( FractureConvertSkipsCompound );
 	return 0;
 }
