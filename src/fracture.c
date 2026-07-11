@@ -1772,7 +1772,7 @@ static int b3F_voronoiSlice( b3FractureWorld* fw, const b3HullData* srcHull, int
 }
 
 static void b3F_formChunkBody( b3FractureWorld* fw, int piece, const int* chunkIds, int count, b3WorldTransform xf,
-							   b3Vec3 vel, b3Vec3 omega, bool isStatic )
+							   b3Vec3 vel, b3Vec3 omega, bool isStatic, const b3HullData* intactHull )
 {
 	b3BodyDef bd = b3DefaultBodyDef();
 	bd.type = isStatic ? b3_staticBody : b3_dynamicBody;
@@ -1782,18 +1782,38 @@ static void b3F_formChunkBody( b3FractureWorld* fw, int piece, const int* chunkI
 	bd.angularVelocity = omega;
 	b3BodyId body = b3CreateBody( fw->worldId, &bd );
 
-	for ( int i = 0; i < count; ++i )
+	if ( intactHull != NULL )
 	{
-		b3F_Chunk* ch = fw->chunks.data + chunkIds[i];
-		ch->piece = piece;
-		b3FractureMaterial* mat = fw->materials.data + ch->mat;
+		// one smooth collision shape for the whole body; chunks share it (used only for recolour)
+		b3FractureMaterial* mat = fw->materials.data + fw->chunks.data[chunkIds[0]].mat;
 		b3ShapeDef sd = b3DefaultShapeDef();
 		sd.density = mat->density;
 		sd.baseMaterial.friction = mat->friction;
 		sd.baseMaterial.restitution = mat->restitution;
 		sd.baseMaterial.customColor = mat->color ? mat->color : 1u;
 		sd.enableContactEvents = true;
-		ch->shape = b3CreateHullShape( body, &sd, ch->hull );
+		b3ShapeId shape = b3CreateHullShape( body, &sd, intactHull );
+		for ( int i = 0; i < count; ++i )
+		{
+			fw->chunks.data[chunkIds[i]].piece = piece;
+			fw->chunks.data[chunkIds[i]].shape = shape;
+		}
+	}
+	else
+	{
+		for ( int i = 0; i < count; ++i )
+		{
+			b3F_Chunk* ch = fw->chunks.data + chunkIds[i];
+			ch->piece = piece;
+			b3FractureMaterial* mat = fw->materials.data + ch->mat;
+			b3ShapeDef sd = b3DefaultShapeDef();
+			sd.density = mat->density;
+			sd.baseMaterial.friction = mat->friction;
+			sd.baseMaterial.restitution = mat->restitution;
+			sd.baseMaterial.customColor = mat->color ? mat->color : 1u;
+			sd.enableContactEvents = true;
+			ch->shape = b3CreateHullShape( body, &sd, ch->hull );
+		}
 	}
 
 	b3FracturePiece* P = fw->pieces.data + piece;
@@ -1877,7 +1897,7 @@ static int b3F_addChunkBody( b3FractureWorld* fw, const b3HullData* srcHull, b3W
 	bool bodyStatic = def->isStatic || anyAnchor;
 
 	int piece = b3F_allocPiece( fw );
-	b3F_formChunkBody( fw, piece, chunkIds, n, xf, def->velocity, b3Vec3_zero, bodyStatic );
+	b3F_formChunkBody( fw, piece, chunkIds, n, xf, def->velocity, b3Vec3_zero, bodyStatic, srcHull );
 	return piece;
 }
 
@@ -2114,8 +2134,10 @@ static void b3F_splitChunkPiece( b3FractureWorld* fw, int piece )
 		if ( m == 0 )
 			continue;
 		int target = ( comp == 0 ) ? piece : b3F_allocPiece( fw );
+		// a fractured fragment is an arbitrary (possibly non-convex) subset of chunks: it must
+		// collide as its individual chunk hulls, so no intact hull here
 		b3F_formChunkBody( fw, target, compIds, m, xf, childStatic ? b3Vec3_zero : pvel,
-						   childStatic ? b3Vec3_zero : pomega, childStatic );
+						   childStatic ? b3Vec3_zero : pomega, childStatic, NULL );
 	}
 
 	b3Free( compIds, (size_t)count * sizeof( int ) );
@@ -2534,6 +2556,14 @@ int b3World_MakeBodyFracture( b3WorldId worldId, b3BodyId bodyId, b3FractureMate
 		chunks = 8;
 	if ( chunks > 28 )
 		chunks = 28;
+
+	float originalMass = b3Body_GetMass( bodyId );
+	if ( md.mass > 1e-9f && originalMass > 0.0f && material.density > 0.0f )
+	{
+		float newDensity = originalMass / md.mass; // md.mass is the hull volume (density 1)
+		material.strength *= newDensity / material.density;
+		material.density = newDensity;
+	}
 
 	b3FractureWorld* fw = b3F_getOrCreate( world, worldId, 1.0f, 0.0f );
 	b3FractureDef local = def ? *def : b3DefaultFractureDef();
