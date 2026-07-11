@@ -290,6 +290,127 @@ static int FractureConvertBody( void )
 	return 0;
 }
 
+typedef struct DomCollect
+{
+	b3BodyId ids[1024];
+	int count;
+} DomCollect;
+
+static bool CollectBodiesCb( b3ShapeId shapeId, void* ctx )
+{
+	DomCollect* c = (DomCollect*)ctx;
+	b3BodyId b = b3Shape_GetBody( shapeId );
+	for ( int i = 0; i < c->count; ++i )
+		if ( c->ids[i].index1 == b.index1 && c->ids[i].world0 == b.world0 && c->ids[i].generation == b.generation )
+			return true;
+	if ( c->count < 1024 )
+		c->ids[c->count++] = b;
+	return true;
+}
+
+static void DominoBuild( b3WorldId worldId )
+{
+	b3BoxHull box = b3MakeBoxHull( 0.125f, 0.5f, 0.25f );
+	b3ShapeDef sd = b3DefaultShapeDef();
+	sd.baseMaterial.friction = 0.6f;
+	sd.density = 4.0f;
+	b3BodyDef bd = b3DefaultBodyDef();
+	bd.type = b3_dynamicBody;
+	int count = 15;
+	float x = -0.5f * count;
+	for ( int i = 0; i < count; ++i )
+	{
+		bd.position = ( b3Pos ){ x, 0.5f, 0.0f };
+		b3BodyId body = b3CreateBody( worldId, &bd );
+		b3CreateHullShape( body, &sd, &box.base );
+		if ( i == 0 )
+			b3Body_ApplyLinearImpulse( body, ( b3Vec3 ){ 0.2f, 0.0f, 0.0f }, ( b3Pos ){ x, 1.0f, 0.0f }, true );
+		x += 1.01f;
+	}
+}
+
+static int DominoToppledCount( b3WorldId worldId )
+{
+	DomCollect c = { 0 };
+	b3AABB huge = { { -1.0e4f, -1.0e4f, -1.0e4f }, { 1.0e4f, 1.0e4f, 1.0e4f } };
+	b3World_OverlapAABB( worldId, huge, b3DefaultQueryFilter(), CollectBodiesCb, &c );
+	int toppled = 0;
+	for ( int i = 0; i < c.count; ++i )
+	{
+		if ( b3Body_GetType( c.ids[i] ) != b3_dynamicBody )
+			continue;
+		b3Quat q = b3Body_GetRotation( c.ids[i] );
+		float upY = 1.0f - 2.0f * ( q.v.x * q.v.x + q.v.z * q.v.z ); // (R*{0,1,0}).y
+		if ( upY < 0.5f )
+			toppled++;
+	}
+	return toppled;
+}
+
+static int FractureDestructibleDominoesTopple( void )
+{
+	b3WorldId solid = FractureMakeWorld();
+	FractureMakeGround( solid );
+	DominoBuild( solid );
+	FractureStepN( solid, 400 );
+	int solidToppled = DominoToppledCount( solid );
+	b3DestroyWorld( solid );
+	ENSURE( solidToppled >= 5 );
+
+	b3WorldId frac = FractureMakeWorld();
+	FractureMakeGround( frac );
+	DominoBuild( frac );
+	{
+		DomCollect c = { 0 };
+		b3AABB huge = { { -1.0e4f, -1.0e4f, -1.0e4f }, { 1.0e4f, 1.0e4f, 1.0e4f } };
+		b3World_OverlapAABB( frac, huge, b3DefaultQueryFilter(), CollectBodiesCb, &c );
+		for ( int i = 0; i < c.count; ++i )
+			if ( b3Body_GetType( c.ids[i] ) == b3_dynamicBody )
+				b3World_MakeBodyFracture( frac, c.ids[i], b3GetFractureMaterial( b3_fractureStone ), NULL );
+	}
+	FractureStepN( frac, 400 );
+	int fracToppled = DominoToppledCount( frac );
+	ENSURE( FractureBounded( frac ) );
+	b3DestroyWorld( frac );
+
+	ENSURE( fracToppled >= 5 );
+	return 0;
+}
+
+static int FractureConvertPreservesMass( void )
+{
+	b3WorldId w = FractureMakeWorld();
+	FractureMakeGround( w );
+
+	b3BoxHull block = b3MakeBoxHull( 1.0f, 1.0f, 1.0f );
+	b3BodyDef bd = b3DefaultBodyDef();
+	bd.type = b3_dynamicBody;
+	bd.position = ( b3Pos ){ 0.0f, 1.0f, 0.0f };
+	b3BodyId body = b3CreateBody( w, &bd );
+	b3ShapeDef sd = b3DefaultShapeDef();
+	sd.density = 200.0f; // heavy, like an Arch block
+	b3CreateHullShape( body, &sd, &block.base );
+	float massBefore = b3Body_GetMass( body );
+
+	b3World_MakeBodyFracture( w, body, b3GetFractureMaterial( b3_fractureStone ), NULL );
+
+	DomCollect c = { 0 };
+	b3AABB huge = { { -1.0e4f, -1.0e4f, -1.0e4f }, { 1.0e4f, 1.0e4f, 1.0e4f } };
+	b3World_OverlapAABB( w, huge, b3DefaultQueryFilter(), CollectBodiesCb, &c );
+	float massAfter = 0.0f;
+	for ( int i = 0; i < c.count; ++i )
+		if ( b3Body_GetType( c.ids[i] ) == b3_dynamicBody )
+			massAfter = b3Body_GetMass( c.ids[i] );
+	ENSURE( massAfter > 0.9f * massBefore && massAfter < 1.1f * massBefore ); // mass preserved
+
+	int p0 = b3World_GetFractureBodyCount( w );
+	FractureStepN( w, 90 );
+	ENSURE( b3World_GetFractureBodyCount( w ) == p0 ); // rests intact, does not self-crumble
+	ENSURE( FractureBounded( w ) );
+	b3DestroyWorld( w );
+	return 0;
+}
+
 int FractureTest( void )
 {
 	RUN_SUBTEST( FractureConvexRests );
@@ -301,5 +422,7 @@ int FractureTest( void )
 	RUN_SUBTEST( FractureStressField );
 	RUN_SUBTEST( FractureRestingBeamHolds );
 	RUN_SUBTEST( FractureBridgeHoldsThenBreaks );
+	RUN_SUBTEST( FractureDestructibleDominoesTopple );
+	RUN_SUBTEST( FractureConvertPreservesMass );
 	return 0;
 }
