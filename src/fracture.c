@@ -1901,6 +1901,58 @@ static int b3F_addChunkBody( b3FractureWorld* fw, const b3HullData* srcHull, b3W
 	return piece;
 }
 
+static int b3F_addCompoundBody( b3FractureWorld* fw, const b3HullData* const* hulls, int nHulls, b3WorldTransform xf,
+								b3FractureMaterial material, const b3FractureDef* def )
+{
+	if ( nHulls < 1 || nHulls > B3F_MAX_SEEDS )
+		return -1;
+	int matIdx = b3F_internMaterial( fw, material );
+	float density = fw->materials.data[matIdx].density;
+	int chunkBase = fw->chunks.count;
+	int ifaceBase = fw->interfaces.count;
+	int chunkIds[B3F_MAX_SEEDS];
+	int n = 0;
+	for ( int i = 0; i < nHulls; ++i )
+	{
+		b3HullData* clone = b3CloneHull( hulls[i] );
+		if ( clone == NULL )
+			continue;
+		b3F_Chunk chunk = { 0 };
+		chunk.hull = clone;
+		b3MassData md = b3ComputeHullMass( clone, density );
+		chunk.centroid = md.center;
+		chunk.mass = md.mass;
+		chunk.mat = matIdx;
+		chunk.piece = -1;
+		chunk.restOn = -1;
+		chunkIds[n++] = fw->chunks.count;
+		b3Array_Push( fw->chunks, chunk );
+	}
+	if ( n == 0 )
+		return -1;
+	b3F_buildChunkAdjacency( fw, chunkBase, ifaceBase ); // no interfaces added -> each chunk has degree 0
+
+	bool anyAnchor = false;
+	for ( int i = 0; i < n; ++i )
+	{
+		b3F_Chunk* ch = fw->chunks.data + chunkIds[i];
+		bool a = def->isStatic;
+		if ( def->anchor )
+		{
+			b3Vec3i cell = { (int)lroundf( ch->centroid.x ), (int)lroundf( ch->centroid.y ),
+							 (int)lroundf( ch->centroid.z ) };
+			a = def->anchor( cell, def->anchorContext );
+		}
+		ch->anchor = a ? 1 : 0;
+		anyAnchor = anyAnchor || a;
+	}
+	bool bodyStatic = def->isStatic || anyAnchor;
+
+	int piece = b3F_allocPiece( fw );
+	b3F_formChunkBody( fw, piece, chunkIds, n, xf, def->velocity, b3Vec3_zero, bodyStatic, NULL );
+	return piece;
+}
+
 static b3Vec3 b3F_chunkWorld( b3FractureWorld* fw, int c )
 {
 	b3F_Chunk* ch = fw->chunks.data + c;
@@ -2116,6 +2168,9 @@ static void b3F_splitChunkPiece( b3FractureWorld* fw, int piece )
 	b3WorldTransform xf = b3Body_GetTransform( P->body );
 	b3Vec3 pomega = b3Body_GetAngularVelocity( P->body );
 	b3Vec3 pvel = b3Body_GetWorldPointVelocity( P->body, xf.p );
+	float gravityScale = b3Body_GetGravityScale( P->body );
+	float linearDamping = b3Body_GetLinearDamping( P->body );
+	float angularDamping = b3Body_GetAngularDamping( P->body );
 
 	b3F_destroyPieceBody( fw, piece );
 
