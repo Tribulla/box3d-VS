@@ -452,28 +452,45 @@ static int FractureConvertPreservesGravityScale( void )
 	return 0;
 }
 
-static int FractureConvertSkipsCompound( void )
+static int FractureConvertCompound( void )
 {
 	b3WorldId w = FractureMakeWorld();
 	FractureMakeGround( w );
 
 	b3BodyDef bd = b3DefaultBodyDef();
 	bd.type = b3_dynamicBody;
-	bd.position = ( b3Pos ){ 0.0f, 3.0f, 0.0f };
-	bd.gravityScale = 0.0f;
+	bd.position = ( b3Pos ){ 0.0f, 4.0f, 0.0f };
+	bd.gravityScale = 0.0f; // floats, like the Gyroscopic Torque demo
 	b3BodyId body = b3CreateBody( w, &bd );
 	b3ShapeDef sd = b3DefaultShapeDef();
-	b3HullData* cyl = b3CreateCylinder( 0.6f, 0.15f, 0.0f, 16 );
-	b3BoxHull box = b3MakeBoxHull( 1.0f, 0.05f, 0.1f );
+	b3HullData* cyl = b3CreateCylinder( 1.2f, 0.4f, 0.0f, 16 );
+	b3BoxHull box = b3MakeBoxHull( 2.0f, 0.1f, 0.2f );
 	b3CreateHullShape( body, &sd, cyl );
 	b3CreateHullShape( body, &sd, &box.base );
 	b3DestroyHull( cyl );
 	ENSURE( b3Body_GetShapeCount( body ) == 2 );
 
 	int piece = b3World_MakeBodyFracture( w, body, b3GetFractureMaterial( b3_fractureStone ), NULL );
-	ENSURE( piece < 0 );						 // compound body was skipped, not converted
-	ENSURE( b3Body_IsValid( body ) );			 // original left intact...
-	ENSURE( b3Body_GetShapeCount( body ) == 2 ); // ...with BOTH shapes still present
+	ENSURE( piece >= 0 );							   // compound body IS converted now
+	ENSURE( b3World_GetFractureBodyCount( w ) == 1 ); // as a single destructible body
+
+	DomCollect c = { 0 };
+	b3AABB huge = { { -1.0e4f, -1.0e4f, -1.0e4f }, { 1.0e4f, 1.0e4f, 1.0e4f } };
+	b3World_OverlapAABB( w, huge, b3DefaultQueryFilter(), CollectBodiesCb, &c );
+	b3BodyId conv = c.ids[0];
+	for ( int i = 0; i < c.count; ++i )
+		if ( b3Body_GetType( c.ids[i] ) == b3_dynamicBody )
+			conv = c.ids[i];
+	ENSURE( b3Body_GetShapeCount( conv ) == 2 ); // BOTH shapes preserved, nothing dropped
+
+	FractureStepN( w, 60 );
+	ENSURE( b3World_GetFractureBodyCount( w ) == 1 );		   // stays whole while intact
+	ENSURE( b3Body_GetWorldCenterOfMass( conv ).y > 3.0f );	   // still floating (gravityScale kept)
+
+	FractureFireBall( w, ( b3Vec3 ){ 0.0f, 4.0f, 12.0f }, ( b3Vec3 ){ 0.0f, 0.0f, -140.0f }, 0.5f );
+	FractureStepN( w, 120 );
+	ENSURE( b3World_GetFractureBodyCount( w ) > 1 ); // a hard hit breaks it into its pieces
+	ENSURE( FractureBounded( w ) );
 	b3DestroyWorld( w );
 	return 0;
 }
@@ -492,6 +509,6 @@ int FractureTest( void )
 	RUN_SUBTEST( FractureDestructibleDominoesTopple );
 	RUN_SUBTEST( FractureConvertPreservesMass );
 	RUN_SUBTEST( FractureConvertPreservesGravityScale );
-	RUN_SUBTEST( FractureConvertSkipsCompound );
+	RUN_SUBTEST( FractureConvertCompound );
 	return 0;
 }
