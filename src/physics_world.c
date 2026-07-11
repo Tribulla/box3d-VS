@@ -11,6 +11,7 @@
 #include "contact.h"
 #include "core.h"
 #include "ctz.h"
+#include "fracture.h"
 #include "hull_map.h"
 #include "island.h"
 #include "joint.h"
@@ -407,6 +408,8 @@ void b3DestroyWorld( b3WorldId worldId )
 	}
 
 	world->locked = true;
+
+	b3FractureWorld_Destroy( world );
 
 	// Detach any recording before teardown. The user owns and frees the recording buffer.
 	b3StopRecordingInternal( world );
@@ -1168,6 +1171,14 @@ void b3World_Step( b3WorldId worldId, float timeStep, int subStepCount )
 	b3Array_Clear( world->sensorEndEvents[world->endEventArrayIndex] );
 	b3Array_Clear( world->contactEndEvents[world->endEventArrayIndex] );
 	world->locked = false;
+
+	if ( world->fractureWorld != NULL && timeStep > 0.0f )
+	{
+		struct b3Recording* rec = world->recording;
+		world->recording = NULL;
+		b3FractureWorld_Step( world, timeStep );
+		world->recording = rec;
+	}
 
 	if ( world->recording != NULL )
 	{

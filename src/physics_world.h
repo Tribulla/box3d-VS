@@ -266,6 +266,8 @@ typedef struct b3World
 	// cleared by b3World_StopRecording. Hooks in mutators check this before writing.
 	struct b3Recording* recording;
 
+	void* fractureWorld;
+
 	// latest inverse sub-step
 	float inv_h;
 
