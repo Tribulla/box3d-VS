@@ -2587,35 +2587,46 @@ int b3World_MakeBodyFracture( b3WorldId worldId, b3BodyId bodyId, b3FractureMate
 				return -1;
 
 	int nsh = b3Body_GetShapeCount( bodyId );
-	if ( nsh < 1 )
+	if ( nsh < 1 || nsh > 16 )
 		return -1;
 	b3ShapeId shapes[16];
-	int got = b3Body_GetShapes( bodyId, shapes, nsh < 16 ? nsh : 16 );
-	const b3HullData* hull = NULL;
+	int got = b3Body_GetShapes( bodyId, shapes, nsh );
+	const b3HullData* hulls[16];
 	for ( int i = 0; i < got; ++i )
-		if ( b3Shape_GetType( shapes[i] ) == b3_hullShape )
-		{
-			hull = b3Shape_GetHull( shapes[i] );
-			break;
-		}
-	if ( hull == NULL )
-		return -1; // only hull/box bodies convert (spheres/capsules/meshes skipped)
+	{
+		if ( b3Shape_GetType( shapes[i] ) != b3_hullShape )
+			return -1;
+		hulls[i] = b3Shape_GetHull( shapes[i] );
+	}
+	if ( got < 1 )
+		return -1;
+	const b3HullData* hull = hulls[0]; // the sliceable hull for the single-shape path
 
 	b3WorldTransform xf = b3Body_GetTransform( bodyId );
 	b3Vec3 lv = b3Body_GetWorldPointVelocity( bodyId, xf.p );
 	b3Vec3 av = b3Body_GetAngularVelocity( bodyId );
 
-	b3MassData md = b3ComputeHullMass( hull, 1.0f ); // mass at unit density = volume
-	int chunks = (int)( md.mass * 2.0f ) + 6;
+	float gravityScale = b3Body_GetGravityScale( bodyId );
+	float linearDamping = b3Body_GetLinearDamping( bodyId );
+	float angularDamping = b3Body_GetAngularDamping( bodyId );
+	b3MotionLocks motionLocks = b3Body_GetMotionLocks( bodyId );
+	float sleepThreshold = b3Body_GetSleepThreshold( bodyId );
+	bool sleepEnabled = b3Body_IsSleepEnabled( bodyId );
+	bool bullet = b3Body_IsBullet( bodyId );
+
+	float totalVolume = 0.0f; // sum of all hull volumes (mass at unit density)
+	for ( int i = 0; i < got; ++i )
+		totalVolume += b3ComputeHullMass( hulls[i], 1.0f ).mass;
+	int chunks = (int)( totalVolume * 2.0f ) + 6; // seed count for the single-shape slice
 	if ( chunks < 8 )
 		chunks = 8;
 	if ( chunks > 28 )
 		chunks = 28;
 
 	float originalMass = b3Body_GetMass( bodyId );
-	if ( md.mass > 1e-9f && originalMass > 0.0f && material.density > 0.0f )
+	if ( totalVolume > 1e-9f && originalMass > 0.0f && material.density > 0.0f )
 	{
-		float newDensity = originalMass / md.mass; // md.mass is the hull volume (density 1)
+		float newDensity = originalMass / totalVolume;
 		material.strength *= newDensity / material.density;
 		material.density = newDensity;
 	}
@@ -2623,10 +2634,19 @@ int b3World_MakeBodyFracture( b3WorldId worldId, b3BodyId bodyId, b3FractureMate
 	b3FractureWorld* fw = b3F_getOrCreate( world, worldId, 1.0f, 0.0f );
 	b3FractureDef local = def ? *def : b3DefaultFractureDef();
 	local.velocity = lv;
-	int piece = b3F_addChunkBody( fw, hull, xf, chunks, material, &local );
+	int piece = got == 1 ? b3F_addChunkBody( fw, hull, xf, chunks, material, &local )		 // slice into chunks
+						 : b3F_addCompoundBody( fw, hulls, got, xf, material, &local ); // each shape -> one chunk
 	if ( piece < 0 )
 		return -1;
-	b3Body_SetAngularVelocity( fw->pieces.data[piece].body, av );
+	b3BodyId nb = fw->pieces.data[piece].body;
+	b3Body_SetAngularVelocity( nb, av );
+	b3Body_SetGravityScale( nb, gravityScale );
+	b3Body_SetLinearDamping( nb, linearDamping );
+	b3Body_SetAngularDamping( nb, angularDamping );
+	b3Body_SetMotionLocks( nb, motionLocks );
+	b3Body_SetSleepThreshold( nb, sleepThreshold );
+	b3Body_EnableSleep( nb, sleepEnabled );
+	b3Body_SetBullet( nb, bullet );
 	b3DestroyBody( bodyId );
 	return piece;
 }
