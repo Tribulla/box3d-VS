@@ -1,9 +1,11 @@
 #include "fracture.h"
 
 #include "box3d/box3d.h"
+#include "box3d/constants.h"
 
 #include "container.h"
 #include "core.h"
+#include "parallel_for.h"
 #include "physics_world.h"
 
 #include <limits.h>
@@ -246,12 +248,23 @@ enum b3F_ScratchId
 	B3F_SC_C_SUPPORT,
 	B3F_SC_C_COORD,
 	B3F_SC_C_SORTED,
+	B3F_SC_C_SIDX,
+	B3F_SC_C_SUPPRE,
 	B3F_SC_C_PIFS,
 	B3F_SC_C_IA,
 	B3F_SC_C_IB,
 	B3F_SC_C_ICEN,
 	B3F_SC_C_IAREA,
 	B3F_SC_C_ISTR,
+	B3F_SC_C_STRADDLE,
+	B3F_SC_C_PREF,
+	B3F_SC_C_PRECROSS,
+	B3F_SC_C_PREMP,
+	B3F_SC_C_PREM,
+	B3F_SC_C_SUFF,
+	B3F_SC_C_SUFCROSS,
+	B3F_SC_C_SUFMP,
+	B3F_SC_C_SUFM,
 
 	B3F_SC_V_VOX,
 	B3F_SC_V_WP,
@@ -263,6 +276,18 @@ enum b3F_ScratchId
 	B3F_SC_V_ORDER,
 	B3F_SC_V_BINOFF,
 	B3F_SC_V_CURSOR,
+	B3F_SC_V_SUPPRE,
+	B3F_SC_V_PREF,
+	B3F_SC_V_PRECROSS,
+	B3F_SC_V_PREMP,
+	B3F_SC_V_PREM,
+	B3F_SC_V_SUFF,
+	B3F_SC_V_SUFCROSS,
+	B3F_SC_V_SUFMP,
+	B3F_SC_V_SUFM,
+
+	B3F_SC_PLIST, // parallel analysis: piece worklist (worker 0 only)
+	B3F_SC_PDEC,  // parallel analysis: per-piece decisions (worker 0 only)
 
 	B3F_SC_COUNT
 };
@@ -287,12 +312,17 @@ typedef struct b3FractureWorld
 	b3Array( int ) chunkIfCount;
 	b3Array( int ) chunkIfList;
 
-	b3F_Buf scratch[B3F_SC_COUNT];
+	b3Array( int ) debrisQueue; // split-born single-chunk/single-voxel pieces, oldest first
+	int debrisHead;				// consumed prefix of debrisQueue (tuning.maxDebris enforcement)
+
+	float profSeverMs; // this step's sever/split time (b3Profile.fractureSever), reset each step
+
+	b3F_Buf scratch[B3_MAX_WORKERS][B3F_SC_COUNT];
 } b3FractureWorld;
 
-static void* b3F_scratch( b3FractureWorld* fw, int slot, size_t bytes )
+static void* b3F_scratchW( b3FractureWorld* fw, int worker, int slot, size_t bytes )
 {
-	b3F_Buf* b = fw->scratch + slot;
+	b3F_Buf* b = &fw->scratch[worker][slot];
 	if ( b->cap < bytes )
 	{
 		size_t nb = bytes + ( bytes >> 1 ) + 64;
@@ -302,6 +332,11 @@ static void* b3F_scratch( b3FractureWorld* fw, int slot, size_t bytes )
 		b->cap = nb;
 	}
 	return b->ptr;
+}
+
+static void* b3F_scratch( b3FractureWorld* fw, int slot, size_t bytes )
+{
+	return b3F_scratchW( fw, 0, slot, bytes );
 }
 
 b3FractureMaterial b3GetFractureMaterial( b3FractureMaterialType type )
@@ -341,8 +376,11 @@ b3FractureTuning b3DefaultFractureTuning( void )
 	t.minFragment = 2;
 	t.fractureHoldFrames = 4;
 	t.warmupFrames = 25;
+	t.analysisStride = 1;
+	t.maxDebris = 0;
 	t.fractureEnabled = true;
 	t.contactStress = true;
+	t.parallelAnalysis = false;
 	return t;
 }
 
@@ -769,7 +807,7 @@ static void b3F_splitPiece( b3FractureWorld* fw, int piece )
 	b3WorldTransform xf = b3Body_GetTransform( P->body );
 	b3Vec3 pvel = b3Body_GetLinearVelocity( P->body );
 	b3Vec3 pomega = b3Body_GetAngularVelocity( P->body );
-	b3Pos pcom = b3Body_GetWorldCenterOfMass( P->body );
+	b3Pos pcom = b3Body_GetWorldCenter( P->body );
 	b3Quat prot = xf.q;
 	bool pdebris = P->debris != 0;
 	bool pmerge = P->merge != 0;
@@ -830,6 +868,8 @@ static void b3F_splitPiece( b3FractureWorld* fw, int piece )
 		int target = ( ci == 0 ) ? piece : b3F_allocPiece( fw );
 		P = NULL; // pieces array may have grown; do not use stale P below
 		b3F_formBody( fw, target, scratch, n, cwpos, prot, vel, pomega, childStatic, pdebris, pmerge );
+		if ( !childStatic && n == 1 )
+			b3Array_Push( fw->debrisQueue, target ); // candidate for the tuning.maxDebris cap
 	}
 
 	b3Free( cwpos, (size_t)count * sizeof( b3Vec3 ) );
@@ -844,7 +884,86 @@ static void b3F_splitPiece( b3FractureWorld* fw, int piece )
 
 static int b3F_chunkAt( b3FractureWorld* fw, int p, b3Pos worldPt ); // defined in the chunk backend below
 
-static void b3F_gatherContactForces( b3FractureWorld* fw, float invDt )
+static void b3F_gatherPiece( b3FractureWorld* fw, int p, int worker, float invDt, float a, b3Vec3 gUp )
+{
+	b3FracturePiece* P = fw->pieces.data + p;
+	if ( !P->active )
+		return;
+	if ( P->kind == b3F_kindChunk && P->voxels.count < 2 )
+		return;
+	if ( P->isStatic == 0 && b3Body_IsAwake( P->body ) == false )
+		return;
+	int cap = b3Body_GetContactCapacity( P->body );
+	if ( cap <= 0 )
+		return;
+	b3ContactData* buf = (b3ContactData*)b3F_scratchW( fw, worker, B3F_SC_CONTACTS, (size_t)cap * sizeof( b3ContactData ) );
+	int n = b3Body_GetContactData( P->body, buf, cap );
+	b3Pos ourCom = b3Body_GetWorldCenter( P->body );
+	for ( int k = 0; k < n; ++k )
+	{
+		b3ContactData* cd = buf + k;
+		b3BodyId bodyA = b3Shape_GetBody( cd->shapeIdA );
+		bool weAreA = B3_ID_EQUALS( bodyA, P->body );
+		b3BodyId other = weAreA ? b3Shape_GetBody( cd->shapeIdB ) : bodyA;
+		bool otherStatic = b3Body_GetType( other ) == b3_staticBody;
+		int otherKey = otherStatic ? -2 : (int)other.index1; // distinct dynamic body id
+		for ( int m = 0; m < cd->manifoldCount; ++m )
+		{
+			const b3Manifold* man = cd->manifolds + m;
+			b3Vec3 normal = man->normal; // A -> B
+			float sign = weAreA ? -1.0f : 1.0f;
+			for ( int pt = 0; pt < man->pointCount; ++pt )
+			{
+				const b3ManifoldPoint* mp = man->points + pt;
+				if ( mp->normalVelocity < -P->peakApproach )
+					P->peakApproach = -mp->normalVelocity;
+				if ( mp->totalNormalImpulse <= 0.0f )
+					continue;
+				float mag = mp->totalNormalImpulse * invDt;
+				b3Vec3 Ffull = b3MulSV( sign * mag, normal );
+				b3Vec3 anchor = weAreA ? mp->anchorA : mp->anchorB;
+				b3Pos worldPt = b3OffsetPos( ourCom, anchor );
+				if ( P->kind == b3F_kindChunk )
+				{
+					int c = b3F_chunkAt( fw, p, worldPt );
+					if ( c < 0 )
+						continue;
+					b3F_Chunk* ch = fw->chunks.data + c;
+					ch->force = b3Add( ch->force, b3MulSV( a, Ffull ) );
+					ch->forceRaw = b3Add( ch->forceRaw, Ffull );
+					if ( b3Dot( Ffull, gUp ) > 0.0f )
+						ch->restOn = otherKey;
+					continue;
+				}
+				int v = b3F_voxelAt( fw, p, worldPt );
+				if ( v < 0 )
+					continue;
+				b3FractureVoxel* vx = b3F_vox( fw, v );
+				vx->force = b3Add( vx->force, b3MulSV( a, Ffull ) );
+				vx->forceRaw = b3Add( vx->forceRaw, Ffull );
+				if ( b3Dot( Ffull, gUp ) > 0.0f )
+					vx->restOn = otherKey;
+			}
+		}
+	}
+}
+
+typedef struct b3F_GatherCtx
+{
+	b3FractureWorld* fw;
+	float invDt;
+	float a;
+	b3Vec3 gUp;
+} b3F_GatherCtx;
+
+static void b3F_gatherTask( int startIndex, int endIndex, int workerIndex, void* context )
+{
+	b3F_GatherCtx* ctx = (b3F_GatherCtx*)context;
+	for ( int p = startIndex; p < endIndex; ++p )
+		b3F_gatherPiece( ctx->fw, p, workerIndex, ctx->invDt, ctx->a, ctx->gUp );
+}
+
+static void b3F_gatherContactForces( b3World* world, b3FractureWorld* fw, float invDt )
 {
 	for ( int p = 0; p < fw->pieces.count; ++p )
 		fw->pieces.data[p].peakApproach = 0.0f;
@@ -884,77 +1003,15 @@ static void b3F_gatherContactForces( b3FractureWorld* fw, float invDt )
 		if ( fw->chunks.data[c].piece >= 0 )
 			fw->chunks.data[c].force = b3MulSV( 1.0f - a, fw->chunks.data[c].force );
 
-	int capMax = 0;
-	for ( int p = 0; p < fw->pieces.count; ++p )
-		if ( fw->pieces.data[p].active )
-		{
-			int c = b3Body_GetContactCapacity( fw->pieces.data[p].body );
-			if ( c > capMax )
-				capMax = c;
-		}
-	if ( capMax == 0 )
-		return;
-	b3ContactData* buf = (b3ContactData*)b3F_scratch( fw, B3F_SC_CONTACTS, (size_t)capMax * sizeof( b3ContactData ) );
-
-	for ( int p = 0; p < fw->pieces.count; ++p )
+	if ( fw->tuning.parallelAnalysis && world->workerCount > 1 )
 	{
-		b3FracturePiece* P = fw->pieces.data + p;
-		if ( !P->active )
-			continue;
-		if ( P->isStatic == 0 && b3Body_IsAwake( P->body ) == false )
-			continue;
-		int cap = b3Body_GetContactCapacity( P->body );
-		if ( cap <= 0 )
-			continue;
-		int n = b3Body_GetContactData( P->body, buf, cap );
-		b3Pos ourCom = b3Body_GetWorldCenterOfMass( P->body );
-		for ( int k = 0; k < n; ++k )
-		{
-			b3ContactData* cd = buf + k;
-			b3BodyId bodyA = b3Shape_GetBody( cd->shapeIdA );
-			bool weAreA = B3_ID_EQUALS( bodyA, P->body );
-			b3BodyId other = weAreA ? b3Shape_GetBody( cd->shapeIdB ) : bodyA;
-			bool otherStatic = b3Body_GetType( other ) == b3_staticBody;
-			int otherKey = otherStatic ? -2 : (int)other.index1; // distinct dynamic body id
-			for ( int m = 0; m < cd->manifoldCount; ++m )
-			{
-				const b3Manifold* man = cd->manifolds + m;
-				b3Vec3 normal = man->normal; // A -> B
-				float sign = weAreA ? -1.0f : 1.0f;
-				for ( int pt = 0; pt < man->pointCount; ++pt )
-				{
-					const b3ManifoldPoint* mp = man->points + pt;
-					if ( mp->normalVelocity < -P->peakApproach )
-						P->peakApproach = -mp->normalVelocity;
-					if ( mp->totalNormalImpulse <= 0.0f )
-						continue;
-					float mag = mp->totalNormalImpulse * invDt;
-					b3Vec3 Ffull = b3MulSV( sign * mag, normal );
-					b3Vec3 anchor = weAreA ? mp->anchorA : mp->anchorB;
-					b3Pos worldPt = b3OffsetPos( ourCom, anchor );
-					if ( P->kind == b3F_kindChunk )
-					{
-						int c = b3F_chunkAt( fw, p, worldPt );
-						if ( c < 0 )
-							continue;
-						b3F_Chunk* ch = fw->chunks.data + c;
-						ch->force = b3Add( ch->force, b3MulSV( a, Ffull ) );
-						ch->forceRaw = b3Add( ch->forceRaw, Ffull );
-						if ( b3Dot( Ffull, gUp ) > 0.0f )
-							ch->restOn = otherKey;
-						continue;
-					}
-					int v = b3F_voxelAt( fw, p, worldPt );
-					if ( v < 0 )
-						continue;
-					b3FractureVoxel* vx = b3F_vox( fw, v );
-					vx->force = b3Add( vx->force, b3MulSV( a, Ffull ) );
-					vx->forceRaw = b3Add( vx->forceRaw, Ffull );
-					if ( b3Dot( Ffull, gUp ) > 0.0f )
-						vx->restOn = otherKey;
-				}
-			}
-		}
+		b3F_GatherCtx ctx = { fw, invDt, a, gUp };
+		b3ParallelFor( world, b3F_gatherTask, fw->pieces.count, 16, &ctx, "FractureGather" );
+	}
+	else
+	{
+		for ( int p = 0; p < fw->pieces.count; ++p )
+			b3F_gatherPiece( fw, p, 0, invDt, a, gUp );
 	}
 }
 
@@ -992,6 +1049,7 @@ static bool b3F_impactFracture( b3FractureWorld* fw, int piece )
 		b3Free( voxbuf, (size_t)count * sizeof( int ) );
 		return false;
 	}
+	uint64_t profTicks = b3GetTicks(); // the impact response (BFS + sever + split) is sever time
 
 	int radius = fw->tuning.impactRadius + (int)b3F_min( 6.0f, overload - 1.0f );
 	int* frontier = (int*)b3Alloc( (size_t)fw->voxels.count * sizeof( int ) );
@@ -1043,6 +1101,7 @@ static bool b3F_impactFracture( b3FractureWorld* fw, int piece )
 	b3Free( voxbuf, (size_t)count * sizeof( int ) );
 
 	b3F_splitPiece( fw, piece );
+	fw->profSeverMs += b3GetMilliseconds( profTicks );
 	return true;
 }
 
@@ -1112,23 +1171,55 @@ static float b3F_sectionStrength( b3FractureWorld* fw, const b3F_Bond* bonds, in
 	return strength * fw->tuning.strengthScale;
 }
 
-static bool b3F_stressPiece( b3FractureWorld* fw, int piece, bool doFracture )
+typedef struct b3F_Decision
+{
+	int axis;	   // failing cut axis (chunk and voxel kinds)
+	float cut;	   // chunk kind: world coordinate of the cut plane along axis
+	int cellB;	   // voxel kind: cell layer of the cut
+	int freeDir;   // voxel kind: which side is unsupported (+1 / -1 / 0)
+	bool fracture; // sever now
+} b3F_Decision;
+
+static int b3F_stride( const b3FractureWorld* fw )
+{
+	int s = fw->tuning.analysisStride;
+	return s > 1 ? s : 1;
+}
+
+static bool b3F_analysisEligible( const b3FractureWorld* fw, const b3FracturePiece* P )
+{
+	if ( P->isStatic )
+		return true;
+	if ( P->peakApproach > fw->tuning.impactSpeed )
+		return true;
+	float ls = b3Length( b3Body_GetLinearVelocity( P->body ) );
+	float as = b3Length( b3Body_GetAngularVelocity( P->body ) );
+	return ls < fw->tuning.settleSpeed && as < fw->tuning.settleSpeed;
+}
+
+static void b3F_analyzePiece( b3FractureWorld* fw, int worker, int piece, bool doFracture, b3F_Decision* dec )
 {
 	b3FracturePiece* P = fw->pieces.data + piece;
+	dec->fracture = false;
 	int nv = P->voxels.count;
+	if ( b3F_stride( fw ) > 1 ) // strided mode zeroes per body at analysis time (no global zeroing)
+		for ( int i = 0; i < nv; ++i )
+			b3F_vox( fw, P->voxels.data[i] )->stress = 0.0f;
 	if ( nv < 2 )
-		return false;
+		return;
+	if ( !b3F_analysisEligible( fw, P ) )
+		return; // overloadStreak freezes until the body can fracture again
 
 	float gmag = b3Length( fw->gravity );
 	b3Vec3 up = ( gmag > B3F_EPS ) ? b3MulSV( -1.0f / gmag, fw->gravity ) : (b3Vec3){ 0, 1, 0 };
 	b3WorldTransform xf = b3Body_GetTransform( P->body );
 
-	int* vox = (int*)b3F_scratch( fw, B3F_SC_V_VOX, (size_t)nv * sizeof( int ) );
+	int* vox = (int*)b3F_scratchW( fw, worker, B3F_SC_V_VOX, (size_t)nv * sizeof( int ) );
 	memcpy( vox, P->voxels.data, (size_t)nv * sizeof( int ) );
-	b3Vec3* wp = (b3Vec3*)b3F_scratch( fw, B3F_SC_V_WP, (size_t)nv * sizeof( b3Vec3 ) );
-	float* mass = (float*)b3F_scratch( fw, B3F_SC_V_MASS, (size_t)nv * sizeof( float ) );
-	b3Vec3* fext = (b3Vec3*)b3F_scratch( fw, B3F_SC_V_FEXT, (size_t)nv * sizeof( b3Vec3 ) );
-	char* support = (char*)b3F_scratch( fw, B3F_SC_V_SUPPORT, (size_t)nv );
+	b3Vec3* wp = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_V_WP, (size_t)nv * sizeof( b3Vec3 ) );
+	float* mass = (float*)b3F_scratchW( fw, worker, B3F_SC_V_MASS, (size_t)nv * sizeof( float ) );
+	b3Vec3* fext = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_V_FEXT, (size_t)nv * sizeof( b3Vec3 ) );
+	char* support = (char*)b3F_scratchW( fw, worker, B3F_SC_V_SUPPORT, (size_t)nv );
 
 	for ( int i = 0; i < nv; ++i )
 	{
@@ -1184,25 +1275,16 @@ static bool b3F_stressPiece( b3FractureWorld* fw, int piece, bool doFracture )
 		nsup += s ? 1 : 0;
 	}
 
-	bool fractured = false;
 	if ( nsup == 0 || nsup == nv )
-		goto done;
+		return;
 	{
 		bool span = !fixedSupport && spanCount >= 2;
-
-		bool eligible = true;
-		if ( !P->isStatic )
-		{
-			float ls = b3Length( b3Body_GetLinearVelocity( P->body ) );
-			float as = b3Length( b3Body_GetAngularVelocity( P->body ) );
-			eligible = ( ls < fw->tuning.settleSpeed && as < fw->tuning.settleSpeed ) ||
-					   ( P->peakApproach > fw->tuning.impactSpeed );
-		}
 
 		const float A_cell = fw->voxel * fw->voxel;
 		float bestFail = 1.0f;
 		int bestAxis = -1, bestB = 0, bestFreeDir = 0;
-		b3F_Bond* bonds = (b3F_Bond*)b3F_scratch( fw, B3F_SC_V_BONDS, (size_t)nv * sizeof( b3F_Bond ) );
+		b3F_Bond* bonds = (b3F_Bond*)b3F_scratchW( fw, worker, B3F_SC_V_BONDS, (size_t)nv * sizeof( b3F_Bond ) );
+		b3Vec3 ref = wp[0]; // a member position: keeps every moment lever arm piece-sized
 
 		for ( int axis = 0; axis < 3; ++axis )
 		{
@@ -1222,16 +1304,25 @@ static bool b3F_stressPiece( b3FractureWorld* fw, int piece, bool doFracture )
 			int range = cmax - cmin + 1;
 			const int* binVox = NULL;
 			const int* binOff = NULL;
+			const int* supPre = NULL; // integer partition prefixes (bit-identical to the direct scan)
+			const b3Vec3* preF = NULL; // per-bin running sums for the free-body cut (reordered summation)
+			const b3Vec3* preCross = NULL;
+			const b3Vec3* preMP = NULL;
+			const float* preM = NULL;
+			const b3Vec3* sufF = NULL; // and the same summed from the high end, for a high free side
+			const b3Vec3* sufCross = NULL;
+			const b3Vec3* sufMP = NULL;
+			const float* sufM = NULL;
 			if ( range >= 1 && range <= 4 * nv + 64 )
 			{
-				int* off = (int*)b3F_scratch( fw, B3F_SC_V_BINOFF, (size_t)( range + 1 ) * sizeof( int ) );
+				int* off = (int*)b3F_scratchW( fw, worker, B3F_SC_V_BINOFF, (size_t)( range + 1 ) * sizeof( int ) );
 				memset( off, 0, (size_t)( range + 1 ) * sizeof( int ) );
 				for ( int i = 0; i < nv; ++i )
 					off[b3F_iaxis( b3F_vox( fw, vox[i] )->cell, axis ) - cmin + 1]++;
 				for ( int c = 0; c < range; ++c )
 					off[c + 1] += off[c];
-				int* order = (int*)b3F_scratch( fw, B3F_SC_V_ORDER, (size_t)nv * sizeof( int ) );
-				int* cursor = (int*)b3F_scratch( fw, B3F_SC_V_CURSOR, (size_t)range * sizeof( int ) );
+				int* order = (int*)b3F_scratchW( fw, worker, B3F_SC_V_ORDER, (size_t)nv * sizeof( int ) );
+				int* cursor = (int*)b3F_scratchW( fw, worker, B3F_SC_V_CURSOR, (size_t)range * sizeof( int ) );
 				for ( int c = 0; c < range; ++c )
 					cursor[c] = off[c];
 				for ( int i = 0; i < nv; ++i )
@@ -1241,6 +1332,64 @@ static bool b3F_stressPiece( b3FractureWorld* fw, int piece, bool doFracture )
 				}
 				binVox = order;
 				binOff = off;
+
+				if ( !span )
+				{
+					int* sp = (int*)b3F_scratchW( fw, worker, B3F_SC_V_SUPPRE, (size_t)( range + 1 ) * sizeof( int ) );
+					b3Vec3* pf = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_V_PREF, (size_t)( range + 1 ) * sizeof( b3Vec3 ) );
+					b3Vec3* pc = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_V_PRECROSS, (size_t)( range + 1 ) * sizeof( b3Vec3 ) );
+					b3Vec3* pm = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_V_PREMP, (size_t)( range + 1 ) * sizeof( b3Vec3 ) );
+					float* pw = (float*)b3F_scratchW( fw, worker, B3F_SC_V_PREM, (size_t)( range + 1 ) * sizeof( float ) );
+					b3Vec3* sf = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_V_SUFF, (size_t)( range + 1 ) * sizeof( b3Vec3 ) );
+					b3Vec3* sc = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_V_SUFCROSS, (size_t)( range + 1 ) * sizeof( b3Vec3 ) );
+					b3Vec3* sm = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_V_SUFMP, (size_t)( range + 1 ) * sizeof( b3Vec3 ) );
+					float* sw = (float*)b3F_scratchW( fw, worker, B3F_SC_V_SUFM, (size_t)( range + 1 ) * sizeof( float ) );
+					for ( int c = 0; c <= range; ++c )
+					{
+						sp[c] = 0;
+						sf[c] = b3Vec3_zero; // raw per-bin sums first; suffixed in place below
+						sc[c] = b3Vec3_zero;
+						sm[c] = b3Vec3_zero;
+						sw[c] = 0.0f;
+					}
+					for ( int i = 0; i < nv; ++i )
+					{
+						int c = b3F_iaxis( b3F_vox( fw, vox[i] )->cell, axis ) - cmin;
+						sp[c + 1] += support[i];
+						sf[c] = b3Add( sf[c], fext[i] );
+						sc[c] = b3Add( sc[c], b3Cross( b3Sub( wp[i], ref ), fext[i] ) );
+						sm[c] = b3MulAdd( sm[c], mass[i], b3Sub( wp[i], ref ) );
+						sw[c] += mass[i];
+					}
+					pf[0] = b3Vec3_zero;
+					pc[0] = b3Vec3_zero;
+					pm[0] = b3Vec3_zero;
+					pw[0] = 0.0f;
+					for ( int c = 0; c < range; ++c )
+					{
+						sp[c + 1] += sp[c];
+						pf[c + 1] = b3Add( pf[c], sf[c] );
+						pc[c + 1] = b3Add( pc[c], sc[c] );
+						pm[c + 1] = b3Add( pm[c], sm[c] );
+						pw[c + 1] = pw[c] + sw[c];
+					}
+					for ( int c = range - 1; c >= 0; --c )
+					{
+						sf[c] = b3Add( sf[c], sf[c + 1] );
+						sc[c] = b3Add( sc[c], sc[c + 1] );
+						sm[c] = b3Add( sm[c], sm[c + 1] );
+						sw[c] += sw[c + 1];
+					}
+					supPre = sp;
+					preF = pf;
+					preCross = pc;
+					preMP = pm;
+					preM = pw;
+					sufF = sf;
+					sufCross = sc;
+					sufMP = sm;
+					sufM = sw;
+				}
 			}
 
 			if ( span )
@@ -1261,7 +1410,7 @@ static bool b3F_stressPiece( b3FractureWorld* fw, int piece, bool doFracture )
 					continue;
 				b3Vec3 dLoad = b3MulSV( 1.0f / gpn, gperp );
 
-				float* q = (float*)b3F_scratch( fw, B3F_SC_V_Q, (size_t)nv * sizeof( float ) );
+				float* q = (float*)b3F_scratchW( fw, worker, B3F_SC_V_Q, (size_t)nv * sizeof( float ) );
 				float W = 0.0f, ac = 0.0f;
 				for ( int i = 0; i < nv; ++i )
 				{
@@ -1324,19 +1473,33 @@ static bool b3F_stressPiece( b3FractureWorld* fw, int piece, bool doFracture )
 
 			for ( int b = cmin; b < cmax; ++b )
 			{
-				int nlow = 0, nhigh = 0, slow = 0, shigh = 0;
-				for ( int i = 0; i < nv; ++i )
+				int nlow, nhigh, slow, shigh;
+				if ( binOff != NULL && supPre != NULL )
 				{
-					bool low = b3F_iaxis( b3F_vox( fw, vox[i] )->cell, axis ) <= b;
-					if ( low )
+					nlow = binOff[b - cmin + 1]; // voxels with cell coord <= b (exact integer partition)
+					nhigh = nv - nlow;
+					slow = supPre[b - cmin + 1];
+					shigh = nsup - slow;
+				}
+				else
+				{
+					nlow = 0;
+					nhigh = 0;
+					slow = 0;
+					shigh = 0;
+					for ( int i = 0; i < nv; ++i )
 					{
-						nlow++;
-						slow += support[i];
-					}
-					else
-					{
-						nhigh++;
-						shigh += support[i];
+						bool low = b3F_iaxis( b3F_vox( fw, vox[i] )->cell, axis ) <= b;
+						if ( low )
+						{
+							nlow++;
+							slow += support[i];
+						}
+						else
+						{
+							nhigh++;
+							shigh += support[i];
+						}
 					}
 				}
 				if ( nlow == 0 || nhigh == 0 )
@@ -1356,22 +1519,52 @@ static bool b3F_stressPiece( b3FractureWorld* fw, int piece, bool doFracture )
 				c0 = b3MulSV( 1.0f / (float)nb, c0 );
 				float A = nb * A_cell;
 
-				b3Vec3 F = b3Vec3_zero, Mv = b3Vec3_zero, comFree = b3Vec3_zero;
-				float mFree = 0.0f;
-				for ( int i = 0; i < nv; ++i )
+				b3Vec3 F, Mv, comFree;
+				float mFree;
+				if ( preF != NULL )
 				{
-					bool onFree = freeIsHigh ? ( b3F_iaxis( b3F_vox( fw, vox[i] )->cell, axis ) > b )
-											 : ( b3F_iaxis( b3F_vox( fw, vox[i] )->cell, axis ) <= b );
-					if ( !onFree )
+					int bi = b - cmin + 1;
+					b3Vec3 crossSum, MP;
+					if ( freeIsHigh )
+					{
+						F = sufF[bi];
+						crossSum = sufCross[bi];
+						MP = sufMP[bi];
+						mFree = sufM[bi];
+					}
+					else
+					{
+						F = preF[bi];
+						crossSum = preCross[bi];
+						MP = preMP[bi];
+						mFree = preM[bi];
+					}
+					if ( mFree <= B3F_EPS )
 						continue;
-					F = b3Add( F, fext[i] );
-					Mv = b3Add( Mv, b3Cross( b3Sub( wp[i], c0 ), fext[i] ) );
-					comFree = b3MulAdd( comFree, mass[i], wp[i] );
-					mFree += mass[i];
+					Mv = b3Sub( crossSum, b3Cross( b3Sub( c0, ref ), F ) );
+					comFree = b3Add( ref, b3MulSV( 1.0f / mFree, MP ) );
 				}
-				if ( mFree <= B3F_EPS )
-					continue;
-				comFree = b3MulSV( 1.0f / mFree, comFree );
+				else
+				{
+					F = b3Vec3_zero;
+					Mv = b3Vec3_zero;
+					comFree = b3Vec3_zero;
+					mFree = 0.0f;
+					for ( int i = 0; i < nv; ++i )
+					{
+						bool onFree = freeIsHigh ? ( b3F_iaxis( b3F_vox( fw, vox[i] )->cell, axis ) > b )
+												 : ( b3F_iaxis( b3F_vox( fw, vox[i] )->cell, axis ) <= b );
+						if ( !onFree )
+							continue;
+						F = b3Add( F, fext[i] );
+						Mv = b3Add( Mv, b3Cross( b3Sub( wp[i], c0 ), fext[i] ) );
+						comFree = b3MulAdd( comFree, mass[i], wp[i] );
+						mFree += mass[i];
+					}
+					if ( mFree <= B3F_EPS )
+						continue;
+					comFree = b3MulSV( 1.0f / mFree, comFree );
+				}
 
 				float dn = b3Dot( normal, b3Sub( comFree, c0 ) );
 				b3Vec3 nOut = b3MulSV( dn < 0.0f ? -1.0f : 1.0f, normal );
@@ -1418,64 +1611,74 @@ static bool b3F_stressPiece( b3FractureWorld* fw, int piece, bool doFracture )
 		}
 
 		if ( bestAxis >= 0 )
-			P->overloadStreak++;
+			P->overloadStreak += b3F_stride( fw ); // one analysis stands in for K frames of overload
 		else
 			P->overloadStreak = 0;
 		bool impactNow = P->peakApproach > fw->tuning.impactSpeed;
 		bool sustained = P->overloadStreak >= fw->tuning.fractureHoldFrames;
 
-		if ( doFracture && bestAxis >= 0 && eligible && ( impactNow || sustained ) )
+		// eligibility was checked on entry, so an overload here may sever
+		if ( doFracture && bestAxis >= 0 && ( impactNow || sustained ) )
 		{
-			int axis = bestAxis, b = bestB, freeDir = bestFreeDir;
-			int p1 = ( axis + 1 ) % 3, p2 = ( axis + 2 ) % 3;
-			const float freq = 0.45f;
-			for ( int i = 0; i < nv; ++i )
-			{
-				int v = vox[i];
-				b3FractureVoxel* vx = b3F_vox( fw, v );
-				b3Vec3i c = vx->cell;
-				int ov = 0;
-				if ( fw->tuning.fractureRoughness > 0.0f )
-				{
-					float nz = b3F_valnoise( b3F_iaxis( c, p1 ) * freq, b3F_iaxis( c, p2 ) * freq );
-					if ( freeDir > 0 )
-						ov = (int)lroundf( fw->tuning.fractureRoughness * 0.5f * ( nz + 1.0f ) );
-					else if ( freeDir < 0 )
-						ov = -(int)lroundf( fw->tuning.fractureRoughness * 0.5f * ( nz + 1.0f ) );
-					else
-						ov = (int)lroundf( fw->tuning.fractureRoughness * nz );
-				}
-				bool lv = b3F_iaxis( c, axis ) <= b + ov;
-				for ( int f = 0; f < 6; ++f )
-				{
-					int nvid = b3F_mapGet( &fw->cellToVox, b3F_packCell( (b3Vec3i){ c.x + FACE[f][0], c.y + FACE[f][1],
-																					   c.z + FACE[f][2] } ) );
-					if ( nvid < 0 || b3F_vox( fw, nvid )->piece != piece )
-						continue;
-					b3Vec3i nc = b3F_vox( fw, nvid )->cell;
-					int ov2 = 0;
-					if ( fw->tuning.fractureRoughness > 0.0f )
-					{
-						float nz2 = b3F_valnoise( b3F_iaxis( nc, p1 ) * freq, b3F_iaxis( nc, p2 ) * freq );
-						if ( freeDir > 0 )
-							ov2 = (int)lroundf( fw->tuning.fractureRoughness * 0.5f * ( nz2 + 1.0f ) );
-						else if ( freeDir < 0 )
-							ov2 = -(int)lroundf( fw->tuning.fractureRoughness * 0.5f * ( nz2 + 1.0f ) );
-						else
-							ov2 = (int)lroundf( fw->tuning.fractureRoughness * nz2 );
-					}
-					bool ln = b3F_iaxis( nc, axis ) <= b + ov2;
-					if ( lv != ln )
-						b3F_sever( fw, v, f );
-				}
-			}
-			b3F_splitPiece( fw, piece );
-			fractured = true;
+			dec->axis = bestAxis;
+			dec->cellB = bestB;
+			dec->freeDir = bestFreeDir;
+			dec->fracture = true;
 		}
 	}
+}
 
-done:
-	return fractured;
+static void b3F_severVoxelPiece( b3FractureWorld* fw, int piece, const b3F_Decision* dec )
+{
+	uint64_t profTicks = b3GetTicks();
+	b3FracturePiece* P = fw->pieces.data + piece;
+	int nv = P->voxels.count;
+	const int* vox = P->voxels.data;
+	int axis = dec->axis, b = dec->cellB, freeDir = dec->freeDir;
+	int p1 = ( axis + 1 ) % 3, p2 = ( axis + 2 ) % 3;
+	const float freq = 0.45f;
+	for ( int i = 0; i < nv; ++i )
+	{
+		int v = vox[i];
+		b3FractureVoxel* vx = b3F_vox( fw, v );
+		b3Vec3i c = vx->cell;
+		int ov = 0;
+		if ( fw->tuning.fractureRoughness > 0.0f )
+		{
+			float nz = b3F_valnoise( b3F_iaxis( c, p1 ) * freq, b3F_iaxis( c, p2 ) * freq );
+			if ( freeDir > 0 )
+				ov = (int)lroundf( fw->tuning.fractureRoughness * 0.5f * ( nz + 1.0f ) );
+			else if ( freeDir < 0 )
+				ov = -(int)lroundf( fw->tuning.fractureRoughness * 0.5f * ( nz + 1.0f ) );
+			else
+				ov = (int)lroundf( fw->tuning.fractureRoughness * nz );
+		}
+		bool lv = b3F_iaxis( c, axis ) <= b + ov;
+		for ( int f = 0; f < 6; ++f )
+		{
+			int nvid = b3F_mapGet( &fw->cellToVox, b3F_packCell( (b3Vec3i){ c.x + FACE[f][0], c.y + FACE[f][1],
+																			   c.z + FACE[f][2] } ) );
+			if ( nvid < 0 || b3F_vox( fw, nvid )->piece != piece )
+				continue;
+			b3Vec3i nc = b3F_vox( fw, nvid )->cell;
+			int ov2 = 0;
+			if ( fw->tuning.fractureRoughness > 0.0f )
+			{
+				float nz2 = b3F_valnoise( b3F_iaxis( nc, p1 ) * freq, b3F_iaxis( nc, p2 ) * freq );
+				if ( freeDir > 0 )
+					ov2 = (int)lroundf( fw->tuning.fractureRoughness * 0.5f * ( nz2 + 1.0f ) );
+				else if ( freeDir < 0 )
+					ov2 = -(int)lroundf( fw->tuning.fractureRoughness * 0.5f * ( nz2 + 1.0f ) );
+				else
+					ov2 = (int)lroundf( fw->tuning.fractureRoughness * nz2 );
+			}
+			bool ln = b3F_iaxis( nc, axis ) <= b + ov2;
+			if ( lv != ln )
+				b3F_sever( fw, v, f );
+		}
+	}
+	b3F_splitPiece( fw, piece );
+	fw->profSeverMs += b3GetMilliseconds( profTicks );
 }
 
 #define B3F_MAX_SEEDS 64
@@ -1901,6 +2104,58 @@ static int b3F_addChunkBody( b3FractureWorld* fw, const b3HullData* srcHull, b3W
 	return piece;
 }
 
+static int b3F_addCompoundBody( b3FractureWorld* fw, const b3HullData* const* hulls, int nHulls, b3WorldTransform xf,
+								b3FractureMaterial material, const b3FractureDef* def )
+{
+	if ( nHulls < 1 || nHulls > B3F_MAX_SEEDS )
+		return -1;
+	int matIdx = b3F_internMaterial( fw, material );
+	float density = fw->materials.data[matIdx].density;
+	int chunkBase = fw->chunks.count;
+	int ifaceBase = fw->interfaces.count;
+	int chunkIds[B3F_MAX_SEEDS];
+	int n = 0;
+	for ( int i = 0; i < nHulls; ++i )
+	{
+		b3HullData* clone = b3CloneHull( hulls[i] );
+		if ( clone == NULL )
+			continue;
+		b3F_Chunk chunk = { 0 };
+		chunk.hull = clone;
+		b3MassData md = b3ComputeHullMass( clone, density );
+		chunk.centroid = md.center;
+		chunk.mass = md.mass;
+		chunk.mat = matIdx;
+		chunk.piece = -1;
+		chunk.restOn = -1;
+		chunkIds[n++] = fw->chunks.count;
+		b3Array_Push( fw->chunks, chunk );
+	}
+	if ( n == 0 )
+		return -1;
+	b3F_buildChunkAdjacency( fw, chunkBase, ifaceBase ); // no interfaces added -> each chunk has degree 0
+
+	bool anyAnchor = false;
+	for ( int i = 0; i < n; ++i )
+	{
+		b3F_Chunk* ch = fw->chunks.data + chunkIds[i];
+		bool a = def->isStatic;
+		if ( def->anchor )
+		{
+			b3Vec3i cell = { (int)lroundf( ch->centroid.x ), (int)lroundf( ch->centroid.y ),
+							 (int)lroundf( ch->centroid.z ) };
+			a = def->anchor( cell, def->anchorContext );
+		}
+		ch->anchor = a ? 1 : 0;
+		anyAnchor = anyAnchor || a;
+	}
+	bool bodyStatic = def->isStatic || anyAnchor;
+
+	int piece = b3F_allocPiece( fw );
+	b3F_formChunkBody( fw, piece, chunkIds, n, xf, def->velocity, b3Vec3_zero, bodyStatic, NULL );
+	return piece;
+}
+
 static b3Vec3 b3F_chunkWorld( b3FractureWorld* fw, int c )
 {
 	b3F_Chunk* ch = fw->chunks.data + c;
@@ -1928,8 +2183,31 @@ static int b3F_chunkAt( b3FractureWorld* fw, int p, b3Pos worldPt )
 	return best;
 }
 
-static bool b3F_stressChunkPiece( b3FractureWorld* fw, int piece, bool doFracture );
+static void b3F_analyzeChunkPiece( b3FractureWorld* fw, int worker, int piece, bool doFracture, b3F_Decision* dec );
+static void b3F_severChunkPiece( b3FractureWorld* fw, int piece, const b3F_Decision* dec );
 static bool b3F_impactChunkPiece( b3FractureWorld* fw, int piece );
+
+typedef struct b3F_AnalyzeCtx
+{
+	b3FractureWorld* fw;
+	const int* plist;
+	b3F_Decision* dec;
+	bool doFracture;
+} b3F_AnalyzeCtx;
+
+static void b3F_analyzeTask( int startIndex, int endIndex, int workerIndex, void* context )
+{
+	b3F_AnalyzeCtx* ctx = (b3F_AnalyzeCtx*)context;
+	b3FractureWorld* fw = ctx->fw;
+	for ( int i = startIndex; i < endIndex; ++i )
+	{
+		int p = ctx->plist[i];
+		if ( fw->pieces.data[p].kind == b3F_kindChunk )
+			b3F_analyzeChunkPiece( fw, workerIndex, p, ctx->doFracture, ctx->dec + i );
+		else
+			b3F_analyzePiece( fw, workerIndex, p, ctx->doFracture, ctx->dec + i );
+	}
+}
 
 void b3FractureWorld_Step( b3World* world, float dt )
 {
@@ -1938,38 +2216,133 @@ void b3FractureWorld_Step( b3World* world, float dt )
 		return;
 	fw->frame++;
 	fw->gravity = world->gravity;
+	fw->profSeverMs = 0.0f;
+	uint64_t profT0 = b3GetTicks();
 
-	for ( int v = 0; v < fw->voxels.count; ++v )
-		if ( fw->voxels.data[v].piece >= 0 )
-			fw->voxels.data[v].stress = 0.0f;
-	for ( int c = 0; c < fw->chunks.count; ++c )
-		if ( fw->chunks.data[c].piece >= 0 )
-			fw->chunks.data[c].stress = 0.0f;
+	int stride = b3F_stride( fw );
+	if ( stride == 1 )
+	{
+		for ( int v = 0; v < fw->voxels.count; ++v )
+			if ( fw->voxels.data[v].piece >= 0 )
+				fw->voxels.data[v].stress = 0.0f;
+		for ( int c = 0; c < fw->chunks.count; ++c )
+			if ( fw->chunks.data[c].piece >= 0 )
+				fw->chunks.data[c].stress = 0.0f;
+	}
 
 	float invDt = dt > 0.0f ? 1.0f / dt : 0.0f;
-	b3F_gatherContactForces( fw, invDt );
+	b3F_gatherContactForces( world, fw, invDt );
+
+	world->profile.fractureGather = b3GetMilliseconds( profT0 ); // stress zeroing + contact gather
+	uint64_t profT1 = b3GetTicks();
 
 	bool doFracture = fw->tuning.fractureEnabled && fw->frame > fw->tuning.warmupFrames;
 	int nP = fw->pieces.count; // fixed: fresh children (appended) wait for next step
-	for ( int p = 0; p < nP; ++p )
+	int debrisLive = 0;		   // loose single-chunk / single-voxel pieces (for tuning.maxDebris)
+
+	if ( fw->tuning.parallelAnalysis && world->workerCount > 1 )
 	{
-		b3FracturePiece* P = fw->pieces.data + p;
-		if ( !P->active )
-			continue;
-		if ( P->isStatic == 0 && b3Body_IsAwake( P->body ) == false )
-			continue;
-		bool isChunk = P->kind == b3F_kindChunk;
-		if ( isChunk )
+		int* plist = (int*)b3F_scratch( fw, B3F_SC_PLIST, (size_t)( nP > 0 ? nP : 1 ) * sizeof( int ) );
+		int nList = 0;
+		for ( int p = 0; p < nP; ++p )
 		{
-			if ( doFracture && b3F_impactChunkPiece( fw, p ) )
+			b3FracturePiece* P = fw->pieces.data + p;
+			if ( !P->active )
 				continue;
-			b3F_stressChunkPiece( fw, p, doFracture );
-			continue;
+			if ( P->voxels.count < 2 && !P->isStatic )
+				debrisLive++;
+			if ( P->kind == b3F_kindChunk && P->voxels.count < 2 )
+				continue; // inert: no interfaces left, nothing in the pipeline can affect it
+			if ( P->isStatic == 0 && b3Body_IsAwake( P->body ) == false )
+				continue;
+			bool analyse = stride == 1 || ( ( fw->frame + p ) % stride ) == 0;
+			bool impacted = doFracture && ( P->kind == b3F_kindChunk ? b3F_impactChunkPiece( fw, p )
+																	 : b3F_impactFracture( fw, p ) );
+			if ( !impacted && analyse )
+				plist[nList++] = p;
 		}
-		if ( doFracture && b3F_impactFracture( fw, p ) )
-			continue;
-		b3F_stressPiece( fw, p, doFracture );
+
+		b3F_Decision* dec =
+			(b3F_Decision*)b3F_scratch( fw, B3F_SC_PDEC, (size_t)( nList > 0 ? nList : 1 ) * sizeof( b3F_Decision ) );
+		b3F_AnalyzeCtx ctx = { fw, plist, dec, doFracture };
+		b3ParallelFor( world, b3F_analyzeTask, nList, 4, &ctx, "FractureAnalyze" );
+
+		for ( int i = 0; i < nList; ++i )
+		{
+			if ( !dec[i].fracture )
+				continue;
+			if ( fw->pieces.data[plist[i]].kind == b3F_kindChunk )
+				b3F_severChunkPiece( fw, plist[i], &dec[i] );
+			else
+				b3F_severVoxelPiece( fw, plist[i], &dec[i] );
+		}
 	}
+	else
+	{
+		for ( int p = 0; p < nP; ++p )
+		{
+			b3FracturePiece* P = fw->pieces.data + p;
+			if ( !P->active )
+				continue;
+			if ( P->voxels.count < 2 && !P->isStatic )
+				debrisLive++;
+			if ( P->kind == b3F_kindChunk && P->voxels.count < 2 )
+				continue; // inert: no interfaces left, nothing in the pipeline can affect it
+			if ( P->isStatic == 0 && b3Body_IsAwake( P->body ) == false )
+				continue;
+			bool analyse = stride == 1 || ( ( fw->frame + p ) % stride ) == 0;
+			b3F_Decision dec;
+			if ( P->kind == b3F_kindChunk )
+			{
+				if ( !( doFracture && b3F_impactChunkPiece( fw, p ) ) && analyse )
+				{
+					b3F_analyzeChunkPiece( fw, 0, p, doFracture, &dec );
+					if ( dec.fracture )
+						b3F_severChunkPiece( fw, p, &dec );
+				}
+				continue;
+			}
+			if ( !( doFracture && b3F_impactFracture( fw, p ) ) && analyse )
+			{
+				b3F_analyzePiece( fw, 0, p, doFracture, &dec );
+				if ( dec.fracture )
+					b3F_severVoxelPiece( fw, p, &dec );
+			}
+		}
+	}
+
+	float updateMs = b3GetMilliseconds( profT1 );
+	world->profile.fractureSever = fw->profSeverMs;
+	world->profile.fractureAnalyze = b3F_max( updateMs - fw->profSeverMs, 0.0f );
+	uint64_t profT2 = b3GetTicks();
+
+	if ( fw->tuning.maxDebris > 0 )
+	{
+		int burst = 64;
+		while ( debrisLive > fw->tuning.maxDebris && fw->debrisHead < fw->debrisQueue.count && burst > 0 )
+		{
+			int dp = fw->debrisQueue.data[fw->debrisHead++];
+			b3FracturePiece* D = fw->pieces.data + dp;
+			if ( !D->active || D->isStatic || D->voxels.count >= 2 )
+				continue; // stale queue entry
+			if ( D->kind == b3F_kindVoxel )
+				b3F_destroyVoxels( fw, D->voxels.data, D->voxels.count );
+			else
+				for ( int i = 0; i < D->voxels.count; ++i )
+					fw->chunks.data[D->voxels.data[i]].piece = -1;
+			b3F_destroyPieceBody( fw, dp );
+			debrisLive--;
+			burst--;
+		}
+	}
+	if ( fw->debrisHead > 0 && fw->debrisHead >= fw->debrisQueue.count )
+	{
+		b3Array_Clear( fw->debrisQueue );
+		fw->debrisHead = 0;
+	}
+
+	world->profile.fractureDebris = b3GetMilliseconds( profT2 );
+	world->profile.fracture = b3GetMilliseconds( profT0 );
 }
 
 void b3FractureWorld_Destroy( b3World* world )
@@ -1990,10 +2363,12 @@ void b3FractureWorld_Destroy( b3World* world )
 	b3Array_Destroy( fw->chunkIfStart );
 	b3Array_Destroy( fw->chunkIfCount );
 	b3Array_Destroy( fw->chunkIfList );
+	b3Array_Destroy( fw->debrisQueue );
 	b3F_mapFree( &fw->cellToVox );
-	for ( int i = 0; i < B3F_SC_COUNT; ++i )
-		if ( fw->scratch[i].ptr )
-			b3Free( fw->scratch[i].ptr, fw->scratch[i].cap );
+	for ( int w = 0; w < B3_MAX_WORKERS; ++w )
+		for ( int i = 0; i < B3F_SC_COUNT; ++i )
+			if ( fw->scratch[w][i].ptr )
+				b3Free( fw->scratch[w][i].ptr, fw->scratch[w][i].cap );
 	b3Free( fw, sizeof( b3FractureWorld ) );
 	world->fractureWorld = NULL;
 }
@@ -2116,6 +2491,9 @@ static void b3F_splitChunkPiece( b3FractureWorld* fw, int piece )
 	b3WorldTransform xf = b3Body_GetTransform( P->body );
 	b3Vec3 pomega = b3Body_GetAngularVelocity( P->body );
 	b3Vec3 pvel = b3Body_GetWorldPointVelocity( P->body, xf.p );
+	float gravityScale = b3Body_GetGravityScale( P->body );
+	float linearDamping = b3Body_GetLinearDamping( P->body );
+	float angularDamping = b3Body_GetAngularDamping( P->body );
 
 	b3F_destroyPieceBody( fw, piece );
 
@@ -2138,6 +2516,12 @@ static void b3F_splitChunkPiece( b3FractureWorld* fw, int piece )
 		// collide as its individual chunk hulls, so no intact hull here
 		b3F_formChunkBody( fw, target, compIds, m, xf, childStatic ? b3Vec3_zero : pvel,
 						   childStatic ? b3Vec3_zero : pomega, childStatic, NULL );
+		b3BodyId childBody = fw->pieces.data[target].body;
+		b3Body_SetGravityScale( childBody, gravityScale );
+		b3Body_SetLinearDamping( childBody, linearDamping );
+		b3Body_SetAngularDamping( childBody, angularDamping );
+		if ( !childStatic && m == 1 )
+			b3Array_Push( fw->debrisQueue, target ); // candidate for the tuning.maxDebris cap
 	}
 
 	b3Free( compIds, (size_t)count * sizeof( int ) );
@@ -2173,36 +2557,43 @@ static bool b3F_impactChunkPiece( b3FractureWorld* fw, int piece )
 	}
 	if ( !any )
 		return false;
+	uint64_t profTicks = b3GetTicks(); // the impact response (sever + split) is sever time
 
-	for ( int k = 0; k < fw->interfaces.count; ++k )
+	int maxIf = fw->interfaces.count;
+	int* pifs = (int*)b3F_scratch( fw, B3F_SC_C_PIFS, (size_t)( maxIf > 0 ? maxIf : 1 ) * sizeof( int ) );
+	int nif = b3F_pieceInterfaces( fw, piece, pifs, maxIf ); // this piece's unbroken interfaces, ascending
+	for ( int t = 0; t < nif; ++t )
 	{
-		b3F_Interface* I = fw->interfaces.data + k;
-		if ( I->broken )
-			continue;
-		if ( fw->chunks.data[I->a].piece != piece || fw->chunks.data[I->b].piece != piece )
-			continue;
+		b3F_Interface* I = fw->interfaces.data + pifs[t];
 		if ( fw->chunks.data[I->a].stress >= 1.0f || fw->chunks.data[I->b].stress >= 1.0f )
 			I->broken = 1;
 	}
 	b3F_splitChunkPiece( fw, piece );
+	fw->profSeverMs += b3GetMilliseconds( profTicks );
 	return true;
 }
 
-static bool b3F_stressChunkPiece( b3FractureWorld* fw, int piece, bool doFracture )
+static void b3F_analyzeChunkPiece( b3FractureWorld* fw, int worker, int piece, bool doFracture, b3F_Decision* dec )
 {
 	b3FracturePiece* P = fw->pieces.data + piece;
+	dec->fracture = false;
 	int nc = P->voxels.count;
+	if ( b3F_stride( fw ) > 1 ) // strided mode zeroes per body at analysis time (no global zeroing)
+		for ( int i = 0; i < nc; ++i )
+			fw->chunks.data[P->voxels.data[i]].stress = 0.0f;
 	if ( nc < 2 )
-		return false;
+		return;
+	if ( !b3F_analysisEligible( fw, P ) )
+		return; // overloadStreak freezes until the body can fracture again
 
 	float gmag = b3Length( fw->gravity );
 	b3Vec3 up = ( gmag > B3F_EPS ) ? b3MulSV( -1.0f / gmag, fw->gravity ) : (b3Vec3){ 0, 1, 0 };
 	b3WorldTransform xf = b3Body_GetTransform( P->body );
 
-	b3Vec3* wc = (b3Vec3*)b3F_scratch( fw, B3F_SC_C_WC, (size_t)nc * sizeof( b3Vec3 ) );
-	float* mass = (float*)b3F_scratch( fw, B3F_SC_C_MASS, (size_t)nc * sizeof( float ) );
-	b3Vec3* fext = (b3Vec3*)b3F_scratch( fw, B3F_SC_C_FEXT, (size_t)nc * sizeof( b3Vec3 ) );
-	char* support = (char*)b3F_scratch( fw, B3F_SC_C_SUPPORT, (size_t)nc );
+	b3Vec3* wc = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_C_WC, (size_t)nc * sizeof( b3Vec3 ) );
+	float* mass = (float*)b3F_scratchW( fw, worker, B3F_SC_C_MASS, (size_t)nc * sizeof( float ) );
+	b3Vec3* fext = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_C_FEXT, (size_t)nc * sizeof( b3Vec3 ) );
+	char* support = (char*)b3F_scratchW( fw, worker, B3F_SC_C_SUPPORT, (size_t)nc );
 	int nsup = 0;
 	for ( int i = 0; i < nc; ++i )
 	{
@@ -2219,27 +2610,17 @@ static bool b3F_stressChunkPiece( b3FractureWorld* fw, int piece, bool doFractur
 		nsup += support[i];
 	}
 
-	bool fractured = false;
 	if ( nsup == 0 || nsup == nc )
-		goto done;
+		return;
 	{
-		bool eligible = true;
-		if ( !P->isStatic )
-		{
-			float ls = b3Length( b3Body_GetLinearVelocity( P->body ) );
-			float as = b3Length( b3Body_GetAngularVelocity( P->body ) );
-			eligible = ( ls < fw->tuning.settleSpeed && as < fw->tuning.settleSpeed ) ||
-					   ( P->peakApproach > fw->tuning.impactSpeed );
-		}
-
 		int maxIf = fw->interfaces.count;
-		int* pifs = (int*)b3F_scratch( fw, B3F_SC_C_PIFS, (size_t)( maxIf > 0 ? maxIf : 1 ) * sizeof( int ) );
+		int* pifs = (int*)b3F_scratchW( fw, worker, B3F_SC_C_PIFS, (size_t)( maxIf > 0 ? maxIf : 1 ) * sizeof( int ) );
 		int nif = b3F_pieceInterfaces( fw, piece, pifs, maxIf );
-		int* ia = (int*)b3F_scratch( fw, B3F_SC_C_IA, (size_t)( nif > 0 ? nif : 1 ) * sizeof( int ) );
-		int* ib = (int*)b3F_scratch( fw, B3F_SC_C_IB, (size_t)( nif > 0 ? nif : 1 ) * sizeof( int ) );
-		b3Vec3* icen = (b3Vec3*)b3F_scratch( fw, B3F_SC_C_ICEN, (size_t)( nif > 0 ? nif : 1 ) * sizeof( b3Vec3 ) );
-		float* iarea = (float*)b3F_scratch( fw, B3F_SC_C_IAREA, (size_t)( nif > 0 ? nif : 1 ) * sizeof( float ) );
-		float* istr = (float*)b3F_scratch( fw, B3F_SC_C_ISTR, (size_t)( nif > 0 ? nif : 1 ) * sizeof( float ) );
+		int* ia = (int*)b3F_scratchW( fw, worker, B3F_SC_C_IA, (size_t)( nif > 0 ? nif : 1 ) * sizeof( int ) );
+		int* ib = (int*)b3F_scratchW( fw, worker, B3F_SC_C_IB, (size_t)( nif > 0 ? nif : 1 ) * sizeof( int ) );
+		b3Vec3* icen = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_C_ICEN, (size_t)( nif > 0 ? nif : 1 ) * sizeof( b3Vec3 ) );
+		float* iarea = (float*)b3F_scratchW( fw, worker, B3F_SC_C_IAREA, (size_t)( nif > 0 ? nif : 1 ) * sizeof( float ) );
+		float* istr = (float*)b3F_scratchW( fw, worker, B3F_SC_C_ISTR, (size_t)( nif > 0 ? nif : 1 ) * sizeof( float ) );
 		for ( int k = 0; k < nif; ++k )
 		{
 			b3F_Interface* I = fw->interfaces.data + pifs[k];
@@ -2255,8 +2636,20 @@ static bool b3F_stressChunkPiece( b3FractureWorld* fw, int piece, bool doFractur
 		float bestFail = 1.0f;
 		int bestAxis = -1;
 		float bestCut = 0.0f;
-		float* coord = (float*)b3F_scratch( fw, B3F_SC_C_COORD, (size_t)nc * sizeof( float ) );
-		float* sorted = (float*)b3F_scratch( fw, B3F_SC_C_SORTED, (size_t)nc * sizeof( float ) );
+		float* coord = (float*)b3F_scratchW( fw, worker, B3F_SC_C_COORD, (size_t)nc * sizeof( float ) );
+		float* sorted = (float*)b3F_scratchW( fw, worker, B3F_SC_C_SORTED, (size_t)nc * sizeof( float ) );
+		int* sidx = (int*)b3F_scratchW( fw, worker, B3F_SC_C_SIDX, (size_t)nc * sizeof( int ) );
+		int* supPre = (int*)b3F_scratchW( fw, worker, B3F_SC_C_SUPPRE, (size_t)( nc + 1 ) * sizeof( int ) );
+		int* straddle = (int*)b3F_scratchW( fw, worker, B3F_SC_C_STRADDLE, (size_t)( nif > 0 ? nif : 1 ) * sizeof( int ) );
+		b3Vec3* preF = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_C_PREF, (size_t)( nc + 1 ) * sizeof( b3Vec3 ) );
+		b3Vec3* preCross = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_C_PRECROSS, (size_t)( nc + 1 ) * sizeof( b3Vec3 ) );
+		b3Vec3* preMP = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_C_PREMP, (size_t)( nc + 1 ) * sizeof( b3Vec3 ) );
+		float* preM = (float*)b3F_scratchW( fw, worker, B3F_SC_C_PREM, (size_t)( nc + 1 ) * sizeof( float ) );
+		b3Vec3* sufF = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_C_SUFF, (size_t)( nc + 1 ) * sizeof( b3Vec3 ) );
+		b3Vec3* sufCross = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_C_SUFCROSS, (size_t)( nc + 1 ) * sizeof( b3Vec3 ) );
+		b3Vec3* sufMP = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_C_SUFMP, (size_t)( nc + 1 ) * sizeof( b3Vec3 ) );
+		float* sufM = (float*)b3F_scratchW( fw, worker, B3F_SC_C_SUFM, (size_t)( nc + 1 ) * sizeof( float ) );
+		b3Vec3 ref = wc[0]; // a member position: keeps every moment lever arm piece-sized
 
 		for ( int axis = 0; axis < 3; ++axis )
 		{
@@ -2266,17 +2659,47 @@ static bool b3F_stressChunkPiece( b3FractureWorld* fw, int piece, bool doFractur
 			for ( int i = 0; i < nc; ++i )
 				coord[i] = b3Dot( wc[i], normal );
 			for ( int i = 0; i < nc; ++i )
-				sorted[i] = coord[i];
-			for ( int a = 1; a < nc; ++a ) // insertion sort
+				sidx[i] = i;
+			for ( int a = 1; a < nc; ++a ) // insertion sort of indices by coord
 			{
-				float key = sorted[a];
+				int key = sidx[a];
+				float kc = coord[key];
 				int j = a - 1;
-				while ( j >= 0 && sorted[j] > key )
+				while ( j >= 0 && coord[sidx[j]] > kc )
 				{
-					sorted[j + 1] = sorted[j];
+					sidx[j + 1] = sidx[j];
 					j--;
 				}
-				sorted[j + 1] = key;
+				sidx[j + 1] = key;
+			}
+			for ( int i = 0; i < nc; ++i )
+				sorted[i] = coord[sidx[i]];
+			supPre[0] = 0; // supPre[g] = supported chunks among the g smallest coords
+			for ( int i = 0; i < nc; ++i )
+				supPre[i + 1] = supPre[i] + support[sidx[i]];
+			preF[0] = b3Vec3_zero;
+			preCross[0] = b3Vec3_zero;
+			preMP[0] = b3Vec3_zero;
+			preM[0] = 0.0f;
+			for ( int g = 0; g < nc; ++g )
+			{
+				int i = sidx[g];
+				preF[g + 1] = b3Add( preF[g], fext[i] );
+				preCross[g + 1] = b3Add( preCross[g], b3Cross( b3Sub( wc[i], ref ), fext[i] ) );
+				preMP[g + 1] = b3MulAdd( preMP[g], mass[i], b3Sub( wc[i], ref ) );
+				preM[g + 1] = preM[g] + mass[i];
+			}
+			sufF[nc] = b3Vec3_zero;
+			sufCross[nc] = b3Vec3_zero;
+			sufMP[nc] = b3Vec3_zero;
+			sufM[nc] = 0.0f;
+			for ( int g = nc - 1; g >= 0; --g )
+			{
+				int i = sidx[g];
+				sufF[g] = b3Add( sufF[g + 1], fext[i] );
+				sufCross[g] = b3Add( sufCross[g + 1], b3Cross( b3Sub( wc[i], ref ), fext[i] ) );
+				sufMP[g] = b3MulAdd( sufMP[g + 1], mass[i], b3Sub( wc[i], ref ) );
+				sufM[g] = sufM[g + 1] + mass[i];
 			}
 
 			for ( int g = 0; g + 1 < nc; ++g )
@@ -2284,6 +2707,18 @@ static bool b3F_stressChunkPiece( b3FractureWorld* fw, int piece, bool doFractur
 				if ( sorted[g + 1] - sorted[g] < 1e-5f )
 					continue;
 				float cut = 0.5f * ( sorted[g] + sorted[g + 1] );
+
+				int nlow = g + 1;
+				while ( nlow < nc && sorted[nlow] <= cut )
+					nlow++;
+				int nhigh = nc - nlow;
+				if ( nhigh == 0 )
+					continue;
+				int slow = supPre[nlow], shigh = nsup - slow;
+				bool sLow = slow > 0, sHigh = shigh > 0;
+				if ( sLow == sHigh )
+					continue;
+				bool freeIsHigh = !sHigh;
 
 				float A = 0.0f;
 				b3Vec3 c0 = b3Vec3_zero;
@@ -2301,48 +2736,32 @@ static bool b3F_stressChunkPiece( b3FractureWorld* fw, int piece, bool doFractur
 						strength = istr[k];
 						cfac = fw->materials.data[fw->chunks.data[fw->interfaces.data[pifs[k]].a].mat].compressiveFactor;
 					}
-					nStraddle++;
+					straddle[nStraddle++] = k;
 				}
 				if ( nStraddle == 0 || A <= B3F_EPS || strength <= B3F_EPS )
 					continue;
 				c0 = b3MulSV( 1.0f / A, c0 );
 
-				int slow = 0, shigh = 0, nlow = 0, nhigh = 0;
-				for ( int i = 0; i < nc; ++i )
+				b3Vec3 F, crossSum, MP;
+				float mFree;
+				if ( freeIsHigh )
 				{
-					if ( coord[i] <= cut )
-					{
-						nlow++;
-						slow += support[i];
-					}
-					else
-					{
-						nhigh++;
-						shigh += support[i];
-					}
+					F = sufF[nlow];
+					crossSum = sufCross[nlow];
+					MP = sufMP[nlow];
+					mFree = sufM[nlow];
 				}
-				if ( nlow == 0 || nhigh == 0 )
-					continue;
-				bool sLow = slow > 0, sHigh = shigh > 0;
-				if ( sLow == sHigh )
-					continue;
-				bool freeIsHigh = !sHigh;
-
-				b3Vec3 F = b3Vec3_zero, Mv = b3Vec3_zero, comFree = b3Vec3_zero;
-				float mFree = 0.0f;
-				for ( int i = 0; i < nc; ++i )
+				else
 				{
-					bool onFree = freeIsHigh ? ( coord[i] > cut ) : ( coord[i] <= cut );
-					if ( !onFree )
-						continue;
-					F = b3Add( F, fext[i] );
-					Mv = b3Add( Mv, b3Cross( b3Sub( wc[i], c0 ), fext[i] ) );
-					comFree = b3MulAdd( comFree, mass[i], wc[i] );
-					mFree += mass[i];
+					F = preF[nlow];
+					crossSum = preCross[nlow];
+					MP = preMP[nlow];
+					mFree = preM[nlow];
 				}
 				if ( mFree <= B3F_EPS )
 					continue;
-				comFree = b3MulSV( 1.0f / mFree, comFree );
+				b3Vec3 Mv = b3Sub( crossSum, b3Cross( b3Sub( c0, ref ), F ) );
+				b3Vec3 comFree = b3Add( ref, b3MulSV( 1.0f / mFree, MP ) );
 
 				float dn = b3Dot( normal, b3Sub( comFree, c0 ) );
 				b3Vec3 nOut = b3MulSV( dn < 0.0f ? -1.0f : 1.0f, normal );
@@ -2355,11 +2774,9 @@ static bool b3F_stressChunkPiece( b3FractureWorld* fw, int piece, bool doFractur
 				{
 					b3Vec3 d = b3Cross( normal, b3MulSV( 1.0f / Mmag, Mplane ) );
 					float sum = 0.0f, cext = 0.0f;
-					for ( int k = 0; k < nif; ++k )
+					for ( int si = 0; si < nStraddle; ++si )
 					{
-						float da = coord[ia[k]] - cut, db = coord[ib[k]] - cut;
-						if ( da * db >= 0.0f )
-							continue;
+						int k = straddle[si];
 						float s = b3Dot( b3Sub( icen[k], c0 ), d );
 						sum += iarea[k] * s * s + iarea[k] * iarea[k] / 12.0f;
 						float ce = fabsf( s ) + 0.5f * sqrtf( iarea[k] );
@@ -2375,11 +2792,9 @@ static bool b3F_stressChunkPiece( b3FractureWorld* fw, int piece, bool doFractur
 				float view = ( fabsf( nAx ) + bend ) / strength;
 				float fail = b3F_max( tFib, cFib / b3F_max( 1.0f, cfac ) ) / strength;
 
-				for ( int k = 0; k < nif; ++k )
+				for ( int si = 0; si < nStraddle; ++si )
 				{
-					float da = coord[ia[k]] - cut, db = coord[ib[k]] - cut;
-					if ( da * db >= 0.0f )
-						continue;
+					int k = straddle[si];
 					b3F_Chunk* ca = fw->chunks.data + P->voxels.data[ia[k]];
 					b3F_Chunk* cb = fw->chunks.data + P->voxels.data[ib[k]];
 					if ( view > ca->stress )
@@ -2397,30 +2812,44 @@ static bool b3F_stressChunkPiece( b3FractureWorld* fw, int piece, bool doFractur
 		}
 
 		if ( bestAxis >= 0 )
-			P->overloadStreak++;
+			P->overloadStreak += b3F_stride( fw ); // one analysis stands in for K frames of overload
 		else
 			P->overloadStreak = 0;
 		bool sustained = P->overloadStreak >= fw->tuning.fractureHoldFrames;
 		bool impactNow = P->peakApproach > fw->tuning.impactSpeed;
 
-		if ( doFracture && bestAxis >= 0 && eligible && ( impactNow || sustained ) )
+		if ( doFracture && bestAxis >= 0 && ( impactNow || sustained ) )
 		{
-			b3Vec3 e = b3Vec3_zero;
-			( &e.x )[bestAxis] = 1.0f;
-			b3Vec3 normal = b3RotateVector( xf.q, e );
-			for ( int k = 0; k < nif; ++k )
-			{
-				float da = b3Dot( wc[ia[k]], normal ) - bestCut, db = b3Dot( wc[ib[k]], normal ) - bestCut;
-				if ( da * db < 0.0f )
-					fw->interfaces.data[pifs[k]].broken = 1;
-			}
-			b3F_splitChunkPiece( fw, piece );
-			fractured = true;
+			dec->axis = bestAxis;
+			dec->cut = bestCut;
+			dec->fracture = true;
 		}
 	}
+}
 
-done:
-	return fractured;
+static void b3F_severChunkPiece( b3FractureWorld* fw, int piece, const b3F_Decision* dec )
+{
+	uint64_t profTicks = b3GetTicks();
+	b3FracturePiece* P = fw->pieces.data + piece;
+	b3WorldTransform xf = b3Body_GetTransform( P->body );
+	b3Vec3 e = b3Vec3_zero;
+	( &e.x )[dec->axis] = 1.0f;
+	b3Vec3 normal = b3RotateVector( xf.q, e );
+
+	int maxIf = fw->interfaces.count;
+	int* pifs = (int*)b3F_scratch( fw, B3F_SC_C_PIFS, (size_t)( maxIf > 0 ? maxIf : 1 ) * sizeof( int ) );
+	int nif = b3F_pieceInterfaces( fw, piece, pifs, maxIf );
+	for ( int k = 0; k < nif; ++k )
+	{
+		b3F_Interface* I = fw->interfaces.data + pifs[k];
+		b3Vec3 wa = b3ToVec3( b3TransformWorldPoint( xf, fw->chunks.data[I->a].centroid ) );
+		b3Vec3 wb = b3ToVec3( b3TransformWorldPoint( xf, fw->chunks.data[I->b].centroid ) );
+		float da = b3Dot( wa, normal ) - dec->cut, db = b3Dot( wb, normal ) - dec->cut;
+		if ( da * db < 0.0f )
+			I->broken = 1;
+	}
+	b3F_splitChunkPiece( fw, piece );
+	fw->profSeverMs += b3GetMilliseconds( profTicks );
 }
 
 void b3World_EnableFracture( b3WorldId worldId, float voxel, float groundY )
@@ -2532,35 +2961,46 @@ int b3World_MakeBodyFracture( b3WorldId worldId, b3BodyId bodyId, b3FractureMate
 				return -1;
 
 	int nsh = b3Body_GetShapeCount( bodyId );
-	if ( nsh < 1 )
+	if ( nsh < 1 || nsh > 16 )
 		return -1;
 	b3ShapeId shapes[16];
-	int got = b3Body_GetShapes( bodyId, shapes, nsh < 16 ? nsh : 16 );
-	const b3HullData* hull = NULL;
+	int got = b3Body_GetShapes( bodyId, shapes, nsh );
+	const b3HullData* hulls[16];
 	for ( int i = 0; i < got; ++i )
-		if ( b3Shape_GetType( shapes[i] ) == b3_hullShape )
-		{
-			hull = b3Shape_GetHull( shapes[i] );
-			break;
-		}
-	if ( hull == NULL )
-		return -1; // only hull/box bodies convert (spheres/capsules/meshes skipped)
+	{
+		if ( b3Shape_GetType( shapes[i] ) != b3_hullShape )
+			return -1;
+		hulls[i] = b3Shape_GetHull( shapes[i] );
+	}
+	if ( got < 1 )
+		return -1;
+	const b3HullData* hull = hulls[0]; // the sliceable hull for the single-shape path
 
 	b3WorldTransform xf = b3Body_GetTransform( bodyId );
 	b3Vec3 lv = b3Body_GetWorldPointVelocity( bodyId, xf.p );
 	b3Vec3 av = b3Body_GetAngularVelocity( bodyId );
 
-	b3MassData md = b3ComputeHullMass( hull, 1.0f ); // mass at unit density = volume
-	int chunks = (int)( md.mass * 2.0f ) + 6;
+	float gravityScale = b3Body_GetGravityScale( bodyId );
+	float linearDamping = b3Body_GetLinearDamping( bodyId );
+	float angularDamping = b3Body_GetAngularDamping( bodyId );
+	b3MotionLocks motionLocks = b3Body_GetMotionLocks( bodyId );
+	float sleepThreshold = b3Body_GetSleepThreshold( bodyId );
+	bool sleepEnabled = b3Body_IsSleepEnabled( bodyId );
+	bool bullet = b3Body_IsBullet( bodyId );
+
+	float totalVolume = 0.0f; // sum of all hull volumes (mass at unit density)
+	for ( int i = 0; i < got; ++i )
+		totalVolume += b3ComputeHullMass( hulls[i], 1.0f ).mass;
+	int chunks = (int)( totalVolume * 2.0f ) + 6; // seed count for the single-shape slice
 	if ( chunks < 8 )
 		chunks = 8;
 	if ( chunks > 28 )
 		chunks = 28;
 
 	float originalMass = b3Body_GetMass( bodyId );
-	if ( md.mass > 1e-9f && originalMass > 0.0f && material.density > 0.0f )
+	if ( totalVolume > 1e-9f && originalMass > 0.0f && material.density > 0.0f )
 	{
-		float newDensity = originalMass / md.mass; // md.mass is the hull volume (density 1)
+		float newDensity = originalMass / totalVolume;
 		material.strength *= newDensity / material.density;
 		material.density = newDensity;
 	}
@@ -2568,10 +3008,19 @@ int b3World_MakeBodyFracture( b3WorldId worldId, b3BodyId bodyId, b3FractureMate
 	b3FractureWorld* fw = b3F_getOrCreate( world, worldId, 1.0f, 0.0f );
 	b3FractureDef local = def ? *def : b3DefaultFractureDef();
 	local.velocity = lv;
-	int piece = b3F_addChunkBody( fw, hull, xf, chunks, material, &local );
+	int piece = got == 1 ? b3F_addChunkBody( fw, hull, xf, chunks, material, &local )		 // slice into chunks
+						 : b3F_addCompoundBody( fw, hulls, got, xf, material, &local ); // each shape -> one chunk
 	if ( piece < 0 )
 		return -1;
-	b3Body_SetAngularVelocity( fw->pieces.data[piece].body, av );
+	b3BodyId nb = fw->pieces.data[piece].body;
+	b3Body_SetAngularVelocity( nb, av );
+	b3Body_SetGravityScale( nb, gravityScale );
+	b3Body_SetLinearDamping( nb, linearDamping );
+	b3Body_SetAngularDamping( nb, angularDamping );
+	b3Body_SetMotionLocks( nb, motionLocks );
+	b3Body_SetSleepThreshold( nb, sleepThreshold );
+	b3Body_EnableSleep( nb, sleepEnabled );
+	b3Body_SetBullet( nb, bullet );
 	b3DestroyBody( bodyId );
 	return piece;
 }

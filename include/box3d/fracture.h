@@ -67,8 +67,16 @@ typedef struct b3FractureTuning
 	int minFragment;		 ///< fragments smaller than this are deleted as dust
 	int fractureHoldFrames;	 ///< a resting body must stay overloaded this long to snap
 	int warmupFrames;		 ///< let a fresh scene settle before judging its stress
+	int analysisStride;		 ///< stress-analyse each awake body every K frames (1 = every frame). Impacts are
+							 ///< still detected every frame; a non-analysed body keeps its last stress values.
+	int maxDebris;			 ///< cap on loose debris pieces (single chunk / single voxel) kept alive; the oldest
+							 ///< are removed, a few per step, once over the cap. 0 = unlimited. Big collapses
+							 ///< otherwise leave thousands of rubble bodies for the solver every step.
 	bool fractureEnabled;	 ///< master switch: analyse only vs. actually sever
 	bool contactStress;		 ///< fold Box3D contact forces into the analysis
+	bool parallelAnalysis;	 ///< run the per-body contact gathering and stress analysis on the world's
+							 ///< worker threads (needs b3WorldDef.workerCount > 1; all analyses then see
+							 ///< the same pre-fracture snapshot instead of earlier splits in the same step)
 } b3FractureTuning;
 
 B3_API b3FractureTuning b3DefaultFractureTuning( void );

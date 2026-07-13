@@ -41,7 +41,7 @@ B3_API float b3GetStallThreshold( void );
 // Maximum number of colors in the constraint graph. Constraints that cannot
 // find a color are added to the overflow set which are solved single-threaded.
 // The compound barrel benchmark has minor overflow with 24 colors
-#define B3_GRAPH_COLOR_COUNT 24
+#define B3_GRAPH_COLOR_COUNT 48
 
 // Number of contact point buckets for counting the number of contact points per
 // shape contact pair. This is just for reporting and doesn't affect simulation.
@@ -52,7 +52,13 @@ B3_API float b3GetStallThreshold( void );
 // @warning modifying this can have a significant impact on stability
 #define B3_LINEAR_SLOP ( 0.005f * b3GetLengthUnitsPerMeter() )
 
+/// The minimum length of a capsules. Very short capsules should be created as spheres
+/// to avoid numerical problems.
 #define B3_MIN_CAPSULE_LENGTH ( B3_LINEAR_SLOP )
+
+/// Minimum contact point friction weight, lower bound for speculative points. Made small
+/// enough to be washed away by weights that hit 1.
+#define B3_MIN_FRICTION_WEIGHT ( 1e-10f )
 
 /// The distance between shapes where they are considered overlapped. This is needed
 /// because GJK may return small positive values for overlapped shapes in degenerate

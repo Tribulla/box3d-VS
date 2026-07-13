@@ -604,15 +604,28 @@ void Sample::DrawMetrics()
 
 	float fontSize = ImGui::GetFontSize();
 	float menuWidth = InfoPanelWidthEm() * fontSize;
-	float drawerHeight = 16.0f * fontSize;
+	float margin = 0.5f * fontSize;
 	float drawerWidth = m_camera->m_width - menuWidth - 1.5f * fontSize;
 
-	ImGui::SetNextWindowPos( { 0.5f * fontSize, m_camera->m_height - drawerHeight - 0.5f * fontSize } );
-	ImGui::SetNextWindowSize( { drawerWidth, drawerHeight } );
+	float minHeight = 8.0f * fontSize;
+	float maxHeight = b3MaxFloat( minHeight, m_camera->m_height - 3.0f * fontSize );
+
+	static float s_drawerHeight = 0.0f;
+	if ( s_drawerHeight < minHeight )
+	{
+		s_drawerHeight = 16.0f * fontSize; // default on first show
+	}
+	s_drawerHeight = b3ClampFloat( s_drawerHeight, minHeight, maxHeight );
+
+	ImGui::SetNextWindowPos( { margin, m_camera->m_height - s_drawerHeight - margin } );
+	ImGui::SetNextWindowSize( { drawerWidth, s_drawerHeight }, ImGuiCond_FirstUseEver );
+	ImGui::SetNextWindowSizeConstraints( { drawerWidth, minHeight }, { drawerWidth, maxHeight } );
 
 	ImGui::Begin( "Metrics", nullptr,
-				  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
-					  ImGuiWindowFlags_NoTitleBar );
+				  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar );
+
+	// Remember the height the user dragged to so the bottom stays anchored next frame.
+	s_drawerHeight = b3ClampFloat( ImGui::GetWindowSize().y, minHeight, maxHeight );
 
 	if ( ImGui::BeginTabBar( "MetricsTabs", ImGuiTabBarFlags_None ) == false )
 	{
@@ -625,7 +638,7 @@ void Sample::DrawMetrics()
 		int count = m_profileWriteIndex - m_profileReadIndex;
 
 		// Unroll ring buffer into per-field histories.
-		constexpr int kRowCount = 22;
+		constexpr int kRowCount = 27;
 		float histories[kRowCount][m_profileCapacity];
 		float totals[kRowCount] = {};
 		for ( int i = 0; i < count; ++i )
@@ -654,6 +667,11 @@ void Sample::DrawMetrics()
 			histories[19][i] = p.sleepIslands;
 			histories[20][i] = p.bullets;
 			histories[21][i] = p.sensors;
+			histories[22][i] = p.fracture;
+			histories[23][i] = p.fractureGather;
+			histories[24][i] = p.fractureAnalyze;
+			histories[25][i] = p.fractureSever;
+			histories[26][i] = p.fractureDebris;
 
 			totals[0] += p.step;
 			totals[1] += p.pairs;
@@ -677,6 +695,11 @@ void Sample::DrawMetrics()
 			totals[19] += p.sleepIslands;
 			totals[20] += p.bullets;
 			totals[21] += p.sensors;
+			totals[22] += p.fracture;
+			totals[23] += p.fractureGather;
+			totals[24] += p.fractureAnalyze;
+			totals[25] += p.fractureSever;
+			totals[26] += p.fractureDebris;
 		}
 
 		// Smoothed over the last few frames so bars don't jitter visibly.
@@ -728,6 +751,7 @@ void Sample::DrawMetrics()
 		const ImU32 colorCollide = IM_COL32( 255, 140, 51, 255 );
 		const ImU32 colorSolve = IM_COL32( 102, 204, 102, 255 );
 		const ImU32 colorSensors = IM_COL32( 200, 120, 220, 255 );
+		const ImU32 colorFracture = IM_COL32( 255, 105, 97, 255 );
 		const ImU32 colorOther = IM_COL32( 90, 90, 90, 255 );
 		const ImU32 colorDefault = IM_COL32( 220, 220, 220, 255 );
 
@@ -739,7 +763,8 @@ void Sample::DrawMetrics()
 			{ "restitution", 2, colorDefault }, { "store", 2, colorDefault },		 { "split islands", 2, colorDefault },
 			{ "transforms", 1, colorDefault },	{ "joint events", 1, colorDefault }, { "hit events", 1, colorDefault },
 			{ "refit BVH", 1, colorDefault },	{ "sleep", 1, colorDefault },		 { "bullets", 1, colorDefault },
-			{ "sensors", 0, colorSensors },
+			{ "sensors", 0, colorSensors },		{ "fracture", 0, colorFracture },	 { "gather", 1, colorDefault },
+			{ "analysis", 1, colorDefault },	{ "sever", 1, colorDefault },		 { "debris", 1, colorDefault },
 		};
 
 		// Derive parent/child links from the indent levels so we can collapse subtrees.
@@ -776,7 +801,37 @@ void Sample::DrawMetrics()
 		ImGui::SameLine();
 		ImGui::Checkbox( "Show plots", &s_showPlots );
 		ImGui::SameLine();
+		static bool s_expandAll = false;
+		if ( ImGui::Checkbox( "Expand all", &s_expandAll ) )
+		{
+			for ( int r = 0; r < kRowCount; ++r )
+			{
+				s_rowOpen[r] = s_expandAll;
+			}
+		}
+		ImGui::SameLine();
 		ImGui::Text( "   step %.2f ms", now[0] );
+
+		{
+			b3Counters counters = b3World_GetCounters( m_worldId );
+			ImGui::TextDisabled( "bodies %d   contacts %d (awake %d)   joints %d   islands %d", counters.bodyCount,
+								 counters.contactCount, counters.awakeContactCount, counters.jointCount,
+								 counters.islandCount );
+
+			constexpr int kColorCount = (int)( sizeof( counters.colorCounts ) / sizeof( counters.colorCounts[0] ) );
+			int overflowCount = counters.colorCounts[kColorCount - 1];
+			if ( overflowCount > 0 )
+			{
+				ImGui::SameLine();
+				ImGui::TextColored( ImVec4( 1.0f, 0.55f, 0.2f, 1.0f ), "  overflow %d", overflowCount );
+				if ( ImGui::IsItemHovered() )
+				{
+					ImGui::SetTooltip( "contact/joint constraints in the serial overflow color:\n"
+									   "these cannot be solved in parallel, so 'constraints' stops\n"
+									   "scaling with workers. Reduce contact density (e.g. Max debris)." );
+				}
+			}
+		}
 
 		// Flame strip: step subdivided by top-level children.
 		{
@@ -784,7 +839,8 @@ void Sample::DrawMetrics()
 			float collideT = now[2];
 			float solveT = now[3];
 			float sensorsT = now[21];
-			float otherT = b3MaxFloat( stepNow - pairsT - collideT - solveT - sensorsT, 0.0f );
+			float fractureT = now[22];
+			float otherT = b3MaxFloat( stepNow - pairsT - collideT - solveT - sensorsT - fractureT, 0.0f );
 
 			float availWidth = ImGui::GetContentRegionAvail().x;
 			float barHeight = 1.5f * fontSize;
@@ -796,6 +852,7 @@ void Sample::DrawMetrics()
 			x = AddSegment( dl, availWidth, collideT, stepNow, colorCollide, x, cursor, barHeight );
 			x = AddSegment( dl, availWidth, solveT, stepNow, colorSolve, x, cursor, barHeight );
 			x = AddSegment( dl, availWidth, sensorsT, stepNow, colorSensors, x, cursor, barHeight );
+			x = AddSegment( dl, availWidth, fractureT, stepNow, colorFracture, x, cursor, barHeight );
 			x = AddSegment( dl, availWidth, otherT, stepNow, colorOther, x, cursor, barHeight );
 
 			ImGui::Dummy( ImVec2( availWidth, barHeight ) );
@@ -986,7 +1043,7 @@ void Sample::DrawMetrics()
 				int count = s.colorCounts[i];
 				bool isOverflow = ( i == overflowIndex );
 
-				// Skip empty slots, but always show overflow — a non-zero overflow row is the signal we care about.
+				// Skip empty slots, but always show overflow.
 				if ( count == 0 && !isOverflow )
 				{
 					continue;
@@ -1658,7 +1715,6 @@ static void DrawMenuBar( SampleContext* context )
 			ImGui::MenuItem( "Contact Normals", nullptr, &gd->drawContactNormals );
 			ImGui::MenuItem( "Contact Features", nullptr, &gd->drawContactFeatures );
 			ImGui::MenuItem( "Contact Forces", nullptr, &gd->drawContactForces );
-			ImGui::MenuItem( "Friction Forces", nullptr, &gd->drawFrictionForces );
 			if ( ImGui::BeginMenu( "Anchor" ) )
 			{
 				if ( ImGui::MenuItem( "Anchor A", nullptr, gd->drawAnchorA != 0 ) )
