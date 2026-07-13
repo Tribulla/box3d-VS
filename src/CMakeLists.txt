@@ -87,6 +87,8 @@ set(BOX3D_SOURCE_FILES
 	triangle_manifold.c
 	types.c
 	verstable.h
+	voxel_shape.c
+	voxel_shape.h
 	weld_joint.c
 	wheel_joint.c
 
@@ -103,6 +105,7 @@ set(BOX3D_INCLUDE_FILES
 	../include/box3d/id.h
 	../include/box3d/math_functions.h
 	../include/box3d/types.h
+	../include/box3d/voxel.h
 )
 
 # Hide internal functions

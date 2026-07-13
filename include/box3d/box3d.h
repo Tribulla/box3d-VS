@@ -9,6 +9,7 @@
 #include "id.h"
 #include "math_functions.h"
 #include "types.h"
+#include "voxel.h"
 
 #include <stdbool.h>
 

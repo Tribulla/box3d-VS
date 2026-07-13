@@ -10,6 +10,7 @@
 // for sqrtf and remainderf
 #include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 /**
  * @defgroup math Math
@@ -43,6 +44,13 @@ typedef struct b3Vec3
 	float y;
 	float z;
 } b3Vec3;
+
+typedef struct b3Vec3i
+{
+	int32_t x;
+	int32_t y;
+	int32_t z;
+} b3Vec3i;
 
 /// Cosine and sine pair.
 /// This uses a custom implementation designed for cross-platform determinism.

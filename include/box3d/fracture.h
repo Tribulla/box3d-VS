@@ -9,10 +9,6 @@
 
 typedef struct b3HullData b3HullData;
 
-typedef struct b3Vec3i
-{
-	int32_t x, y, z;
-} b3Vec3i;
 
 typedef struct b3FractureMaterial
 {
