@@ -382,7 +382,7 @@ b3FractureTuning b3DefaultFractureTuning( void )
 	t.maxDebris = 0;
 	t.fractureEnabled = true;
 	t.contactStress = true;
-	t.parallelAnalysis = false;
+	t.parallelAnalysis = true;
 	return t;
 }
 
@@ -418,10 +418,9 @@ static b3Vec3 b3F_worldPosLocal( b3WorldTransform xf, b3Vec3 local )
 	return b3ToVec3( b3TransformWorldPoint( xf, local ) );
 }
 
-static int b3F_voxelAt( b3FractureWorld* fw, int p, b3Pos worldPt )
+static int b3F_voxelAt( b3FractureWorld* fw, int p, b3WorldTransform xf, b3Pos worldPt )
 {
 	b3FracturePiece* P = fw->pieces.data + p;
-	b3WorldTransform xf = b3Body_GetTransform( P->body );
 	b3Vec3 local = b3InvTransformWorldPoint( xf, worldPt );
 	b3Vec3i cell;
 	for ( int a = 0; a < 3; ++a )
@@ -902,6 +901,7 @@ static void b3F_gatherPiece( b3FractureWorld* fw, int p, int worker, float invDt
 	b3ContactData* buf = (b3ContactData*)b3F_scratchW( fw, worker, B3F_SC_CONTACTS, (size_t)cap * sizeof( b3ContactData ) );
 	int n = b3Body_GetContactData( P->body, buf, cap );
 	b3Pos ourCom = b3Body_GetWorldCenter( P->body );
+	b3WorldTransform xf = b3Body_GetTransform( P->body ); // hoisted out of the per-point voxel lookup
 	for ( int k = 0; k < n; ++k )
 	{
 		b3ContactData* cd = buf + k;
@@ -938,7 +938,7 @@ static void b3F_gatherPiece( b3FractureWorld* fw, int p, int worker, float invDt
 						ch->restOn = otherKey;
 					continue;
 				}
-				int v = b3F_voxelAt( fw, p, worldPt );
+				int v = b3F_voxelAt( fw, p, xf, worldPt );
 				if ( v < 0 )
 					continue;
 				b3FractureVoxel* vx = b3F_vox( fw, v );

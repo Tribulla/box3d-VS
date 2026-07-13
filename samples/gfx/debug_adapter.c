@@ -75,6 +75,9 @@ typedef struct
 	// owning body transform. Identity transform and no sibling for top-level shapes.
 	int nextChild;
 	b3Transform childTransform;
+
+	bool isBox;
+	b3Vec3 boxOffset;
 	union
 	{
 		DebugSphere sphere;
@@ -454,7 +457,28 @@ static void PopulateCommonFields( DebugShape* us, const b3DebugShape* debugShape
 	us->isGround = B3_ID_EQUALS( debugShape->shapeId, s_adapter.groundShapeId );
 	us->shapeId = debugShape->shapeId;
 	us->bodyId = bodyId;
+	us->isBox = false;
+	us->boxOffset = b3Vec3_zero;
 	RefreshMaterialFromOverride( us );
+}
+
+static bool ResolveBoxHull( const b3HullData* hull, b3Vec3* offsetOut, b3Vec3* scaleOut )
+{
+	if ( hull == NULL || hull->vertexCount != 8 || hull->faceCount != 6 )
+	{
+		return false;
+	}
+	b3Vec3 lo = hull->aabb.lowerBound;
+	b3Vec3 hi = hull->aabb.upperBound;
+	b3Vec3 ext = b3Sub( hi, lo );
+	float aabbVol = ext.x * ext.y * ext.z;
+	if ( aabbVol <= 0.0f || fabsf( hull->volume - aabbVol ) > 1e-4f * aabbVol )
+	{
+		return false;
+	}
+	*offsetOut = b3MulSV( 0.5f, b3Add( lo, hi ) );
+	*scaleOut = ext; // unit cube [-0.5,0.5] * ext == [lo,hi] about the centre
+	return true;
 }
 
 // Resolve one compound child into its own pool slot, mirroring the top-level
@@ -498,6 +522,8 @@ static int CreateCompoundChild( const b3ChildShape* child, const DebugShape* par
 	us->color = parent->color;
 	us->metallic = parent->metallic;
 	us->roughness = parent->roughness;
+	us->isBox = false; // compound children keep the baked-geometry hull path
+	us->boxOffset = b3Vec3_zero;
 
 	switch ( child->type )
 	{
@@ -571,7 +597,9 @@ static void* AdapterCreateDebugShape( const b3DebugShape* debugShape, void* cont
 	if ( debugShape->type == b3_hullShape )
 	{
 		const b3HullData* hull = debugShape->hull;
-		MeshHandle handle = FindOrAddHull( hull );
+		b3Vec3 boxOffset, boxScale;
+		bool isBox = ResolveBoxHull( hull, &boxOffset, &boxScale );
+		MeshHandle handle = isBox ? FindOrAddUnitBox() : FindOrAddHull( hull );
 		if ( !IsMeshHandleValid( handle ) )
 		{
 			return NULL;
@@ -586,7 +614,9 @@ static void* AdapterCreateDebugShape( const b3DebugShape* debugShape, void* cont
 		us->kind = Box3DUS_Hull;
 		PopulateCommonFields( us, debugShape );
 		us->geom.handle = handle;
-		us->geom.scale = b3Vec3_one;
+		us->geom.scale = isBox ? boxScale : b3Vec3_one;
+		us->isBox = isBox;
+		us->boxOffset = isBox ? boxOffset : b3Vec3_zero;
 		return us;
 	}
 
@@ -764,10 +794,12 @@ static void AppendResolvedShape( const DebugShape* us, b3Transform baseTransform
 	{
 		MeshMaterialMode mode = us->isGround ? MESH_MATERIAL_MODE_GROUND_GRID : MESH_MATERIAL_MODE_SOLID;
 		float cell = us->isGround ? BOX3D_GROUND_GRID_CELL_SIZE : 0.0f;
-		AppendMesh( us->geom.handle, baseTransform, us->geom.scale, c, metallic, roughness, mode, cell, shadowCast );
+		b3Transform t = us->isBox ? (b3Transform){ b3TransformPoint( baseTransform, us->boxOffset ), baseTransform.q }
+								  : baseTransform;
+		AppendMesh( us->geom.handle, t, us->geom.scale, c, metallic, roughness, mode, cell, shadowCast );
 		if ( hk != HIGHLIGHT_KIND_NONE )
 		{
-			AppendHighlightGeometry( us->geom.handle, baseTransform, us->geom.scale, hk );
+			AppendHighlightGeometry( us->geom.handle, t, us->geom.scale, hk );
 		}
 	}
 }

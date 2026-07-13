@@ -830,6 +830,19 @@ MeshHandle FindOrAddHull( const b3HullData* hull )
 	return BuildHull( hull, key );
 }
 
+MeshHandle FindOrAddUnitBox( void )
+{
+	b3BoxHull cube = b3MakeCubeHull( 0.5f );
+	uint32_t key = HullGeomKey( &cube.base );
+	MeshHandle existing = FindMesh( key );
+	if ( IsMeshHandleValid( existing ) )
+	{
+		AddMeshReference( existing );
+		return existing;
+	}
+	return BuildHull( &cube.base, key );
+}
+
 MeshHandle FindOrAddMesh( const b3MeshData* meshData )
 {
 	if ( !meshData || meshData->hash == 0u )
