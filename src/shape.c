@@ -579,6 +579,43 @@ void b3DestroyShape( b3ShapeId shapeId, bool updateBodyMass )
 	world->locked = false;
 }
 
+const b3VoxelData* b3GetShapeVoxelData( b3World* world, b3ShapeId shapeId )
+{
+	b3Shape* shape = b3GetShape( world, shapeId );
+	if ( shape == NULL || shape->type != b3_voxelShape )
+		return NULL;
+	return shape->voxel;
+}
+
+void b3Shape_RemoveVoxelCells( b3World* world, b3ShapeId shapeId, const b3Vec3i* cells, int count )
+{
+	if ( world == NULL || count <= 0 )
+		return;
+	b3Shape* shape = b3GetShape( world, shapeId );
+	if ( shape == NULL || shape->type != b3_voxelShape )
+		return;
+
+	b3Voxel_RemoveCells( (b3VoxelData*)shape->voxel, cells, count );
+
+	shape->localCentroid = b3GetShapeCentroid( shape );
+	shape->aabbMargin = b3ComputeShapeMargin( shape );
+
+	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
+	b3WorldTransform transform = b3GetBodyTransformQuick( world, body );
+	if ( shape->proxyKey != B3_NULL_INDEX )
+	{
+		b3BodyType proxyType = B3_PROXY_TYPE( shape->proxyKey );
+		b3UpdateShapeAABBs( shape, transform, proxyType );
+		b3BroadPhase_MoveProxy( &world->broadPhase, shape->proxyKey, shape->fatAABB );
+	}
+	else
+	{
+		b3UpdateShapeAABBs( shape, transform, body->type );
+	}
+
+	b3UpdateBodyMassData( world, body );
+}
+
 b3AABB b3ComputeShapeAABB( const b3Shape* shape, b3Transform transform )
 {
 	switch ( shape->type )

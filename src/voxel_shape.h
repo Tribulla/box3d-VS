@@ -19,6 +19,8 @@ int b3Voxel_GetCells( const b3VoxelData* v, b3Vec3i* out, int cap );
 
 b3MassData b3Voxel_ComputeMass( const b3VoxelData* v, float density );
 
+void b3Voxel_RemoveCells( b3VoxelData* v, const b3Vec3i* cells, int count );
+
 b3CastOutput b3RayCastVoxel( const b3VoxelData* v, const b3RayCastInput* input );
 
 bool b3OverlapVoxel( const b3VoxelData* v, b3Transform xf, const b3ShapeProxy* proxy );

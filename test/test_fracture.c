@@ -651,6 +651,176 @@ static int FractureDynamicSpanSnapsUnderSelfWeight( void )
 	return 0;
 }
 
+static b3BodyId MakeVoxelShapeBody( b3WorldId worldId, bool dynamic, b3Vec3 pos, const b3Vec3i* cells, int n,
+									b3VoxelData** outVd )
+{
+	b3BodyDef bd = b3DefaultBodyDef();
+	bd.type = dynamic ? b3_dynamicBody : b3_staticBody;
+	bd.position = b3ToPos( pos );
+	b3BodyId body = b3CreateBody( worldId, &bd );
+	b3VoxelData* vd = b3CreateVoxelData( cells, n, 1.0f );
+	b3ShapeDef sd = b3DefaultShapeDef();
+	sd.density = 1.0f;
+	sd.enableContactEvents = true; // the fracture engine gathers contact forces from these
+	b3CreateVoxelShape( body, &sd, vd );
+	*outVd = vd;
+	return body;
+}
+
+static int VoxelShapeImpactFractureEmitsEvents( void )
+{
+	b3WorldDef wd = b3DefaultWorldDef();
+	wd.gravity = ( b3Vec3 ){ 0.0f, 0.0f, 0.0f }; // in space: only the impact fractures the hull
+	b3WorldId worldId = b3CreateWorld( &wd );
+	b3World_EnableFracture( worldId, 1.0f, 0.0f );
+	b3FractureTuning t = b3World_GetFractureTuning( worldId );
+	t.warmupFrames = 2; // no settling scene to wait on
+	b3World_SetFractureTuning( worldId, t );
+
+	b3Vec3i cells[15 * 10 * 2];
+	int n = FractureBoxCells( cells, 15, 10, 2, -7, -5, -1 );
+	b3VoxelData* vd = NULL;
+	b3BodyId ship = MakeVoxelShapeBody( worldId, true, ( b3Vec3 ){ 0.0f, 0.0f, 0.0f }, cells, n, &vd );
+
+	int piece = b3World_MakeVoxelBodyFracture( worldId, ship, b3GetFractureMaterial( b3_fractureGlass ), NULL );
+	ENSURE( piece >= 0 );
+	int cellsBefore = b3VoxelData_GetCellCount( vd );
+	ENSURE( cellsBefore == n );
+
+	FractureFireBall( worldId, ( b3Vec3 ){ 0.0f, 0.0f, 9.0f }, ( b3Vec3 ){ 0.0f, 0.0f, -140.0f }, 0.6f );
+
+	bool got = false;
+	for ( int s = 0; s < 90 && !got; ++s )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+		b3FractureEvents ev = b3World_GetFractureEvents( worldId );
+		for ( int e = 0; e < ev.count; ++e )
+		{
+			const b3FractureEvent* fe = ev.events + e;
+			ENSURE( fe->cellCount > 0 );
+			ENSURE( fe->cells != NULL );
+			ENSURE( fe->mass > 0.0f );
+			ENSURE( B3_IS_NULL( fe->fragmentBody ) );				 // host-materialised, no spawned body
+			ENSURE( B3_ID_EQUALS( fe->parentBody, ship ) );
+			ENSURE( fe->reason == b3_fractureImpact );
+			ENSURE( isfinite( fe->centerOfMassWorld.x ) && isfinite( fe->centerOfMassWorld.y ) );
+			ENSURE( isfinite( fe->linearVelocity.z ) && isfinite( fe->angularVelocity.x ) );
+			for ( int i = 0; i < fe->cellCount; ++i )
+			{
+				b3Vec3i c = fe->cells[i];
+				ENSURE( c.x >= -7 && c.x <= 7 && c.y >= -5 && c.y <= 4 && c.z >= -1 && c.z <= 0 );
+				ENSURE( b3VoxelData_IsSolid( vd, c ) == false );
+			}
+			got = true;
+		}
+	}
+	ENSURE( got );
+	ENSURE( b3VoxelData_GetCellCount( vd ) < cellsBefore ); // the collider lost cells
+	ENSURE( FractureBounded( worldId ) );
+
+	b3DestroyWorld( worldId );
+	b3DestroyVoxelData( vd );
+	return 0;
+}
+
+static int VoxelShapeStressFractureEmitsEvents( void )
+{
+	b3WorldDef wd = b3DefaultWorldDef();
+	wd.gravity = ( b3Vec3 ){ 0.0f, -9.81f, 0.0f };
+	b3WorldId worldId = b3CreateWorld( &wd );
+	b3World_EnableFracture( worldId, 1.0f, 0.0f );
+
+	b3Vec3i cells[26 * 4 * 4];
+	int n = FractureBoxCells( cells, 26, 4, 4, -2, 14, -2 );
+	b3VoxelData* vd = NULL;
+	b3BodyId beam = MakeVoxelShapeBody( worldId, false, ( b3Vec3 ){ 0.0f, 0.0f, 0.0f }, cells, n, &vd );
+
+	int anchorThresh = 0; // anchor the two cell columns with x < 0
+	b3FractureDef def = b3DefaultFractureDef();
+	def.anchor = AnchorLowX;
+	def.anchorContext = &anchorThresh;
+	int piece = b3World_MakeVoxelBodyFracture( worldId, beam, b3GetFractureMaterial( b3_fractureConcrete ), &def );
+	ENSURE( piece >= 0 );
+	int cellsBefore = b3VoxelData_GetCellCount( vd );
+
+	bool got = false;
+	b3FractureReason reason = b3_fractureImpact;
+	for ( int s = 0; s < 200 && !got; ++s )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+		b3FractureEvents ev = b3World_GetFractureEvents( worldId );
+		if ( ev.count > 0 )
+		{
+			const b3FractureEvent* fe = ev.events + 0;
+			reason = fe->reason;
+			ENSURE( fe->cellCount > 0 );
+			ENSURE( fe->mass > 0.0f );
+			ENSURE( B3_IS_NULL( fe->fragmentBody ) );
+			ENSURE( isfinite( fe->centerOfMassWorld.y ) );
+			for ( int i = 0; i < fe->cellCount; ++i )
+				ENSURE( b3VoxelData_IsSolid( vd, fe->cells[i] ) == false );
+			got = true;
+		}
+		ENSURE( FractureBounded( worldId ) );
+	}
+	ENSURE( got );
+	ENSURE( reason == b3_fractureStress ); // failed under self-load, not a hit
+	ENSURE( b3VoxelData_GetCellCount( vd ) < cellsBefore );
+
+	b3DestroyWorld( worldId );
+	b3DestroyVoxelData( vd );
+	return 0;
+}
+
+static int VoxelShapeTwoBodiesIndependentFracture( void )
+{
+	b3WorldDef wd = b3DefaultWorldDef();
+	wd.gravity = ( b3Vec3 ){ 0.0f, 0.0f, 0.0f };
+	b3WorldId worldId = b3CreateWorld( &wd );
+	b3World_EnableFracture( worldId, 1.0f, 0.0f );
+	b3FractureTuning t = b3World_GetFractureTuning( worldId );
+	t.warmupFrames = 2;
+	b3World_SetFractureTuning( worldId, t );
+
+	b3Vec3i cells[7 * 7 * 2];
+	int n = FractureBoxCells( cells, 7, 7, 2, -3, -3, -1 ); // identical local grid for both
+	b3VoxelData* vdA = NULL;
+	b3VoxelData* vdB = NULL;
+	b3BodyId shipA = MakeVoxelShapeBody( worldId, true, ( b3Vec3 ){ -12.0f, 0.0f, 0.0f }, cells, n, &vdA );
+	b3BodyId shipB = MakeVoxelShapeBody( worldId, true, ( b3Vec3 ){ 12.0f, 0.0f, 0.0f }, cells, n, &vdB );
+	ENSURE( b3World_MakeVoxelBodyFracture( worldId, shipA, b3GetFractureMaterial( b3_fractureGlass ), NULL ) >= 0 );
+	ENSURE( b3World_MakeVoxelBodyFracture( worldId, shipB, b3GetFractureMaterial( b3_fractureGlass ), NULL ) >= 0 );
+	int aBefore = b3VoxelData_GetCellCount( vdA );
+
+	FractureFireBall( worldId, ( b3Vec3 ){ 12.0f, 0.0f, 9.0f }, ( b3Vec3 ){ 0.0f, 0.0f, -140.0f }, 0.6f ); // smash B only
+
+	bool hitB = false;
+	for ( int s = 0; s < 90 && !hitB; ++s )
+	{
+		b3World_Step( worldId, 1.0f / 60.0f, 4 );
+		b3FractureEvents ev = b3World_GetFractureEvents( worldId );
+		for ( int e = 0; e < ev.count; ++e )
+		{
+			ENSURE( B3_ID_EQUALS( ev.events[e].parentBody, shipB ) ); // never ship A
+			ENSURE( ev.events[e].cellCount > 0 );
+			for ( int i = 0; i < ev.events[e].cellCount; ++i )
+			{
+				b3Vec3i c = ev.events[e].cells[i]; // reported in B's own ORIGINAL coords (bias undone)
+				ENSURE( c.x >= -3 && c.x <= 3 && c.y >= -3 && c.y <= 3 && c.z >= -1 && c.z <= 0 );
+			}
+			hitB = true;
+		}
+	}
+	ENSURE( hitB );
+	ENSURE( b3VoxelData_GetCellCount( vdB ) < n );		 // B (biased) lost cells
+	ENSURE( b3VoxelData_GetCellCount( vdA ) == aBefore ); // A untouched despite identical coords
+
+	b3DestroyWorld( worldId );
+	b3DestroyVoxelData( vdA );
+	b3DestroyVoxelData( vdB );
+	return 0;
+}
+
 int FractureTest( void )
 {
 	RUN_SUBTEST( FractureConvexRests );
@@ -671,5 +841,8 @@ int FractureTest( void )
 	RUN_SUBTEST( FractureConvertPreservesMass );
 	RUN_SUBTEST( FractureConvertPreservesGravityScale );
 	RUN_SUBTEST( FractureConvertCompound );
+	RUN_SUBTEST( VoxelShapeImpactFractureEmitsEvents );
+	RUN_SUBTEST( VoxelShapeStressFractureEmitsEvents );
+	RUN_SUBTEST( VoxelShapeTwoBodiesIndependentFracture );
 	return 0;
 }

@@ -88,6 +88,10 @@ b3AABB b3ComputeSweptCapsuleAABB( const b3Capsule* shape, b3Transform xf1, b3Tra
 
 b3AABB b3ComputeShapeAABB( const b3Shape* shape, b3Transform transform );
 
+const b3VoxelData* b3GetShapeVoxelData( b3World* world, b3ShapeId shapeId );
+
+void b3Shape_RemoveVoxelCells( b3World* world, b3ShapeId shapeId, const b3Vec3i* cells, int count );
+
 // Conservative world AABB for a shape inflated by extra margin. In double precision mode the
 // box is built in the body local frame, translated by the double origin, and rounded outward.
 b3AABB b3ComputeFatShapeAABB( const b3Shape* shape, b3WorldTransform transform, float extra );

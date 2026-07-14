@@ -411,6 +411,101 @@ int b3Voxel_GetCells( const b3VoxelData* v, b3Vec3i* out, int cap )
 	return n;
 }
 
+static uint32_t b3Voxel_cellMix( b3Vec3i c )
+{
+	uint32_t h = ( (uint32_t)c.x * 73856093u ) ^ ( (uint32_t)c.y * 19349663u ) ^ ( (uint32_t)c.z * 83492791u );
+	h ^= h >> 16;
+	h *= 0x7feb352du;
+	h ^= h >> 15;
+	h *= 0x846ca68bu;
+	h ^= h >> 16;
+	return h;
+}
+
+static void b3Voxel_recomputeDerived( b3VoxelData* v )
+{
+	float s = v->voxelSize, half = 0.5f * s;
+	b3AABB whole = { { FLT_MAX, FLT_MAX, FLT_MAX }, { -FLT_MAX, -FLT_MAX, -FLT_MAX } };
+	uint32_t cellsHash = 0;
+	int total = 0;
+	for ( int slot = 0; slot < v->slotCap; ++slot )
+	{
+		if ( v->slots[slot].key == 0 )
+			continue;
+		b3Vec3i cp = b3Voxel_unpackChunk( v->slots[slot].key );
+		b3VoxelChunk* chunk = v->chunks + v->slots[slot].index;
+		int base[3] = { cp.x << B3_VOXEL_CHUNK_BITS, cp.y << B3_VOXEL_CHUNK_BITS, cp.z << B3_VOXEL_CHUNK_BITS };
+		b3AABB cb = { { FLT_MAX, FLT_MAX, FLT_MAX }, { -FLT_MAX, -FLT_MAX, -FLT_MAX } };
+		for ( int k = 0; k < chunk->occupiedCount; ++k )
+		{
+			b3Vec3i lc = chunk->occupied[k];
+			b3Vec3i g = { base[0] + lc.x, base[1] + lc.y, base[2] + lc.z };
+			b3Vec3 lo = { g.x * s - half, g.y * s - half, g.z * s - half };
+			b3Vec3 hi = { g.x * s + half, g.y * s + half, g.z * s + half };
+			cb.lowerBound.x = b3MinFloat( cb.lowerBound.x, lo.x );
+			cb.lowerBound.y = b3MinFloat( cb.lowerBound.y, lo.y );
+			cb.lowerBound.z = b3MinFloat( cb.lowerBound.z, lo.z );
+			cb.upperBound.x = b3MaxFloat( cb.upperBound.x, hi.x );
+			cb.upperBound.y = b3MaxFloat( cb.upperBound.y, hi.y );
+			cb.upperBound.z = b3MaxFloat( cb.upperBound.z, hi.z );
+			cellsHash ^= b3Voxel_cellMix( g );
+			total++;
+		}
+		chunk->solidBounds = cb;
+		if ( chunk->occupiedCount > 0 )
+		{
+			whole.lowerBound.x = b3MinFloat( whole.lowerBound.x, cb.lowerBound.x );
+			whole.lowerBound.y = b3MinFloat( whole.lowerBound.y, cb.lowerBound.y );
+			whole.lowerBound.z = b3MinFloat( whole.lowerBound.z, cb.lowerBound.z );
+			whole.upperBound.x = b3MaxFloat( whole.upperBound.x, cb.upperBound.x );
+			whole.upperBound.y = b3MaxFloat( whole.upperBound.y, cb.upperBound.y );
+			whole.upperBound.z = b3MaxFloat( whole.upperBound.z, cb.upperBound.z );
+		}
+	}
+	uint32_t h = cellsHash * 16777619u;
+	h ^= (uint32_t)( s * 1024.0f );
+	h *= 16777619u;
+	h ^= h >> 16;
+	v->hash = h ? h : 1u;
+	v->cellCount = total;
+	v->hasBounds = total > 0;
+	v->localBounds = total > 0 ? whole : (b3AABB){ b3Vec3_zero, b3Vec3_zero };
+}
+
+void b3Voxel_RemoveCells( b3VoxelData* v, const b3Vec3i* cells, int count )
+{
+	if ( v == NULL || cells == NULL || count <= 0 )
+		return;
+
+	bool removedAny = false;
+	for ( int i = 0; i < count; ++i )
+	{
+		b3Vec3i cell = cells[i];
+		int ci = b3Voxel_findChunk( v, b3Voxel_packChunk( b3Voxel_chunkOf( cell ) ) );
+		if ( ci < 0 )
+			continue;
+		b3VoxelChunk* chunk = v->chunks + ci;
+		int lx = cell.x & B3_VOXEL_CHUNK_MASK, ly = cell.y & B3_VOXEL_CHUNK_MASK, lz = cell.z & B3_VOXEL_CHUNK_MASK;
+		int li = b3Voxel_localIndex( lx, ly, lz );
+		if ( !chunk->solid[li] )
+			continue; // already air (or never solid)
+		chunk->solid[li] = 0;
+		for ( int k = 0; k < chunk->occupiedCount; ++k )
+		{
+			b3Vec3i lc = chunk->occupied[k];
+			if ( lc.x == lx && lc.y == ly && lc.z == lz )
+			{
+				chunk->occupied[k] = chunk->occupied[--chunk->occupiedCount]; // swap-remove
+				break;
+			}
+		}
+		removedAny = true;
+	}
+
+	if ( removedAny )
+		b3Voxel_recomputeDerived( v );
+}
+
 b3MassData b3Voxel_ComputeMass( const b3VoxelData* v, float density )
 {
 	b3MassData md = { 0.0f, b3Vec3_zero, b3Mat3_zero };

@@ -665,7 +665,7 @@ public:
 
 	void ExtraHud() override
 	{
-		DrawTextLine( "%d convex bodies (sphere/box/capsule) on voxel terrain -- Phase 7 convex-vs-voxel",
+		DrawTextLine( "%d convex bodies (sphere/box/capsule) on voxel terrain -- convex-vs-voxel",
 					  (int)m_dynamicBodies.size() );
 	}
 };

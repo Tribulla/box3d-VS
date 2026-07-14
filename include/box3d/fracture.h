@@ -103,6 +103,56 @@ B3_API int b3World_CreateFractureConvex( b3WorldId worldId, const b3HullData* hu
 B3_API int b3World_MakeBodyFracture( b3WorldId worldId, b3BodyId bodyId, b3FractureMaterial material,
 									 const b3FractureDef* def );
 
+/// Make a body carrying a single b3_voxelShape destructible, running the fracture solver
+/// directly on that shape's cell grid (the SAME grid used for collision) — no parallel
+/// voxel body is created. On fracture the severed cells are removed from the parent shape
+/// in place (its collider, mass and AABB update automatically) and reported via
+/// b3World_GetFractureEvents; vox3D does NOT spawn or simulate the fragment body — the host
+/// materialises the new body from the event. Requires b3World_EnableFracture first (the
+/// body's voxel size must match the fracture world's). The body must have exactly one
+/// b3_voxelShape and (for impact fracture to gather contact forces) that shape should have
+/// enableContactEvents = true. @return an internal piece index (>= 0), or -1 on failure.
+B3_API int b3World_MakeVoxelBodyFracture( b3WorldId worldId, b3BodyId bodyId, b3FractureMaterial material,
+										  const b3FractureDef* def );
+
+/// Why a set of cells severed this step.
+typedef enum b3FractureReason
+{
+	b3_fractureImpact, ///< a hard contact knocked the cells loose
+	b3_fractureStress  ///< the cells failed under accumulated load (bending/tension)
+} b3FractureReason;
+
+/// One fragment that severed from a destructible b3_voxelShape this step. The @p cells are
+/// in the SAME integer grid coordinates the host passed to b3CreateVoxelData, so they map
+/// straight back to blocks. @p mass, @p centerOfMassWorld and the inherited velocities let
+/// the host spawn the fragment with correct momentum (v = linearVelocity + angularVelocity
+/// x (p - centerOfMassWorld) for a point p).
+typedef struct b3FractureEvent
+{
+	b3BodyId parentBody;		 ///< the body that lost these cells (its shape was updated in place)
+	b3BodyId fragmentBody;		 ///< the spawned fragment, or b3_nullBodyId when host-materialised
+	uint64_t fragmentId;		 ///< stable id for this fragment this step
+	b3FractureReason reason;	 ///< impact vs stress
+	const b3Vec3i* cells;		 ///< severed cells, in the host's b3CreateVoxelData coordinates
+	int cellCount;				 ///< number of entries in @p cells
+	float mass;					 ///< fragment mass (sum of its cell masses)
+	b3Vec3 centerOfMassWorld;	 ///< fragment centre of mass, world space
+	b3Vec3 linearVelocity;		 ///< inherited world linear velocity of the fragment's centre of mass
+	b3Vec3 angularVelocity;		 ///< inherited world angular velocity
+} b3FractureEvent;
+
+/// The set of fracture events produced by the most recent b3World_Step. The view (and the
+/// @p cells pointers inside each event) is valid only until the next b3World_Step; do not
+/// store it. Empty when fracture is disabled.
+typedef struct b3FractureEvents
+{
+	b3FractureEvent* events;
+	int count;
+} b3FractureEvents;
+
+/// Get the fracture events for the current time step. Transient — see b3FractureEvents.
+B3_API b3FractureEvents b3World_GetFractureEvents( b3WorldId worldId );
+
 B3_API void b3World_ApplyFractureColors( b3WorldId worldId, b3FractureColorMode mode );
 
 B3_API int b3World_GetFractureBodyCount( b3WorldId worldId );

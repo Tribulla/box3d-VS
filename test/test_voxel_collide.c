@@ -631,9 +631,52 @@ static int VoxelConvexFastHitDiag( void )
 	return 0;
 }
 
+static int VoxelConvexImpactHitEvents( void )
+{
+	b3WorldDef wd = b3DefaultWorldDef();
+	wd.gravity = ( b3Vec3 ){ 0.0f, 0.0f, 0.0f };
+	b3WorldId world = b3CreateWorld( &wd );
+
+	b3VoxelData* wall = MakeVoxelBox( 0, 1, -3, 3, -3, 3, 1.0f ); // near face at x = -0.5
+	b3BodyDef wallDef = b3DefaultBodyDef();
+	b3BodyId wallId = b3CreateBody( world, &wallDef );
+	b3ShapeDef wsd = b3DefaultShapeDef();
+	wsd.enableHitEvents = true;
+	b3CreateVoxelShape( wallId, &wsd, wall );
+
+	b3BodyDef bd = b3DefaultBodyDef();
+	bd.type = b3_dynamicBody;
+	bd.position = ( b3Pos ){ -5.0f, 0.0f, 0.0f };
+	bd.linearVelocity = ( b3Vec3 ){ 12.0f, 0.0f, 0.0f }; // moderate: resolved by the narrowphase, not CCD
+	b3BodyId body = b3CreateBody( world, &bd );
+	b3ShapeDef sd = b3DefaultShapeDef();
+	sd.density = 1.0f;
+	sd.enableHitEvents = true;
+	b3Sphere sphere = { { 0.0f, 0.0f, 0.0f }, 0.5f };
+	b3CreateSphereShape( body, &sd, &sphere );
+
+	bool sawHit = false;
+	for ( int i = 0; i < 120; ++i )
+	{
+		b3World_Step( world, 1.0f / 60.0f, 4 );
+		b3ContactEvents ce = b3World_GetContactEvents( world );
+		for ( int h = 0; h < ce.hitCount; ++h )
+			if ( ce.hitEvents[h].approachSpeed > 0.0f )
+				sawHit = true;
+	}
+	float finalX = (float)b3Body_GetPosition( body ).x;
+	b3DestroyWorld( world );
+	b3DestroyVoxelData( wall );
+
+	ENSURE( sawHit );		 // convex-vs-voxel generated impact contacts
+	ENSURE( finalX < -0.9f ); // rested at the near face (centre ~ -1.0), did not pass through
+	return 0;
+}
+
 int VoxelCollideTest( void )
 {
 	RUN_SUBTEST( VoxelConvexFastHitDiag );
+	RUN_SUBTEST( VoxelConvexImpactHitEvents );
 	RUN_SUBTEST( VoxelConvexRest );
 	RUN_SUBTEST( VoxelObbKnownCases );
 	RUN_SUBTEST( VoxelObbFuzz );

@@ -11,6 +11,7 @@
 #include "core.h"
 #include "parallel_for.h"
 #include "physics_world.h"
+#include "shape.h" // b3Shape_RemoveVoxelCells, b3GetShapeVoxelData (host voxel-shape fracture)
 
 #include <limits.h>
 #include <math.h>
@@ -188,6 +189,8 @@ typedef struct b3FractureVoxel
 
 b3DeclareArrayNative( b3FractureVoxel );
 b3DeclareArrayNative( b3FractureMaterial );
+b3DeclareArrayNative( b3FractureEvent );
+b3DeclareArrayNative( b3Vec3i );
 
 typedef struct b3F_Chunk
 {
@@ -236,6 +239,8 @@ typedef struct b3FracturePiece
 	uint8_t debris;
 	uint8_t merge;
 	uint8_t active;
+	uint8_t hostOwned;
+	b3Vec3i cellBias;
 	float peakApproach;
 	int overloadStreak;
 } b3FracturePiece;
@@ -326,6 +331,11 @@ typedef struct b3FractureWorld
 	b3Array( int ) debrisQueue; // split-born single-chunk/single-voxel pieces, oldest first
 	int debrisHead;				// consumed prefix of debrisQueue (tuning.maxDebris enforcement)
 
+	b3Array( b3FractureEvent ) events;
+	b3Array( b3Vec3i ) eventCells;
+	b3Array( int ) eventCellStart;
+	uint64_t nextFragmentId;
+	int hostBindCount; // number of host bodies bound so far; assigns each a unique cellBias lattice slot
 	float profSeverMs; // this step's sever/split time (b3Profile.fractureSever), reset each step
 
 	b3F_Buf scratch[B3_MAX_WORKERS][B3F_SC_COUNT];
@@ -440,6 +450,9 @@ static int b3F_voxelAt( b3FractureWorld* fw, int p, b3WorldTransform xf, b3Pos w
 		float f = ( b3F_faxis( local, a ) - b3F_faxis( P->localOffset, a ) ) / fw->voxel;
 		( &cell.x )[a] = (int)lroundf( f );
 	}
+	cell.x += P->cellBias.x;
+	cell.y += P->cellBias.y;
+	cell.z += P->cellBias.z;
 	int v = b3F_mapGet( &fw->cellToVox, b3F_packCell( cell ) );
 	if ( v >= 0 && b3F_vox( fw, v )->piece == p )
 		return v;
@@ -777,6 +790,12 @@ static void b3F_destroyVoxels( b3FractureWorld* fw, const int* vox, int count )
 static void b3F_destroyPieceBody( b3FractureWorld* fw, int p )
 {
 	b3FracturePiece* P = fw->pieces.data + p;
+	if ( P->hostOwned )
+	{
+		P->active = 0;
+		b3Array_Clear( P->voxels );
+		return;
+	}
 	if ( P->active && b3Body_IsValid( P->body ) )
 		b3DestroyBody( P->body );
 	if ( P->voxelData != NULL )
@@ -825,9 +844,140 @@ static int b3F_components( b3FractureWorld* fw, const int* vox, int count, int p
 	return comp;
 }
 
-static void b3F_splitPiece( b3FractureWorld* fw, int piece )
+static void b3F_emitEvent( b3FractureWorld* fw, int piece, b3FractureReason reason, const b3Vec3i* cells, int cellCount,
+						   float mass, b3Vec3 comWorld, b3Vec3 linVel, b3Vec3 angVel )
+{
+	int start = fw->eventCells.count;
+	b3Array_Append( fw->eventCells, cells, cellCount );
+
+	b3FractureEvent e = { 0 };
+	e.parentBody = fw->pieces.data[piece].body;
+	e.fragmentBody = b3_nullBodyId; // host materialises the fragment
+	e.fragmentId = ++fw->nextFragmentId;
+	e.reason = reason;
+	e.cells = NULL; // patched from eventCellStart once the pool stops growing (end of step)
+	e.cellCount = cellCount;
+	e.mass = mass;
+	e.centerOfMassWorld = comWorld;
+	e.linearVelocity = linVel;
+	e.angularVelocity = angVel;
+	b3Array_Push( fw->events, e );
+	b3Array_Push( fw->eventCellStart, start );
+}
+
+static void b3F_splitHostPiece( b3FractureWorld* fw, int piece, b3FractureReason reason )
 {
 	b3FracturePiece* P = fw->pieces.data + piece;
+	int count = P->voxels.count;
+	if ( count == 0 )
+		return;
+
+	int* vox = (int*)b3Alloc( (size_t)count * sizeof( int ) );
+	memcpy( vox, P->voxels.data, (size_t)count * sizeof( int ) );
+	int* label = (int*)b3Alloc( (size_t)count * sizeof( int ) );
+	int* stack = (int*)b3Alloc( (size_t)count * sizeof( int ) );
+	b3F_Map id2local;
+	memset( &id2local, 0, sizeof( id2local ) );
+	int nComp = b3F_components( fw, vox, count, piece, label, stack, &id2local );
+	b3F_mapFree( &id2local );
+
+	if ( nComp <= 1 )
+	{
+		b3Free( stack, (size_t)count * sizeof( int ) );
+		b3Free( label, (size_t)count * sizeof( int ) );
+		b3Free( vox, (size_t)count * sizeof( int ) );
+		return;
+	}
+
+	int* sizes = (int*)b3AllocZeroed( (size_t)nComp * sizeof( int ) );
+	uint8_t* anchored = (uint8_t*)b3AllocZeroed( (size_t)nComp );
+	for ( int i = 0; i < count; ++i )
+	{
+		sizes[label[i]]++;
+		if ( b3F_vox( fw, vox[i] )->anchor )
+			anchored[label[i]] = 1;
+	}
+	int keep = 0;
+	for ( int c = 1; c < nComp; ++c )
+	{
+		bool better = ( anchored[c] && !anchored[keep] ) || ( anchored[c] == anchored[keep] && sizes[c] > sizes[keep] );
+		if ( better )
+			keep = c;
+	}
+
+	b3WorldTransform xf = b3Body_GetTransform( P->body );
+	b3Vec3 pvel = b3Body_GetLinearVelocity( P->body );
+	b3Vec3 pomega = b3Body_GetAngularVelocity( P->body );
+	b3Vec3 pcom = b3ToVec3( b3Body_GetWorldCenter( P->body ) );
+	b3Vec3i bias = P->cellBias; // undo the per-body grid bias to recover ORIGINAL host cells
+
+	b3Vec3i* fragCells = (b3Vec3i*)b3Alloc( (size_t)count * sizeof( b3Vec3i ) );
+	b3Vec3i* removeCells = (b3Vec3i*)b3Alloc( (size_t)count * sizeof( b3Vec3i ) );
+	int* compVox = (int*)b3Alloc( (size_t)count * sizeof( int ) );
+	int removeCount = 0;
+
+	for ( int c = 0; c < nComp; ++c )
+	{
+		if ( c == keep )
+			continue;
+		int n = 0;
+		double M = 0.0;
+		b3Vec3 com = b3Vec3_zero;
+		for ( int i = 0; i < count; ++i )
+		{
+			if ( label[i] != c )
+				continue;
+			int v = vox[i];
+			compVox[n++] = v;
+			float m = b3F_voxelMass( fw, v );
+			M += m;
+			com = b3MulAdd( com, m, b3F_worldPosLocal( xf, b3F_vox( fw, v )->local ) );
+		}
+		if ( n == 0 || M <= 0.0 )
+			continue;
+		com = b3MulSV( 1.0f / (float)M, com );
+		b3Vec3 vel = b3Add( pvel, b3Cross( pomega, b3Sub( com, pcom ) ) ); // v_com + omega x (com - parentCom)
+
+		for ( int k = 0; k < n; ++k )
+		{
+			b3FractureVoxel* vx = b3F_vox( fw, compVox[k] );
+			b3Vec3i hostCell = { vx->cell.x - bias.x, vx->cell.y - bias.y, vx->cell.z - bias.z };
+			fragCells[k] = hostCell;
+			removeCells[removeCount++] = hostCell;
+			vx->piece = -1;
+		}
+		b3F_emitEvent( fw, piece, reason, fragCells, n, (float)M, com, vel, pomega );
+	}
+
+	if ( removeCount > 0 )
+	{
+		b3World* world = b3GetWorldFromId( fw->worldId );
+		b3Shape_RemoveVoxelCells( world, P->hostShape, removeCells, removeCount );
+		P = fw->pieces.data + piece;
+		b3Array_Clear( P->voxels );
+		for ( int i = 0; i < count; ++i )
+			if ( label[i] == keep )
+				b3Array_Push( P->voxels, vox[i] );
+	}
+
+	b3Free( compVox, (size_t)count * sizeof( int ) );
+	b3Free( removeCells, (size_t)count * sizeof( b3Vec3i ) );
+	b3Free( fragCells, (size_t)count * sizeof( b3Vec3i ) );
+	b3Free( anchored, (size_t)nComp );
+	b3Free( sizes, (size_t)nComp * sizeof( int ) );
+	b3Free( stack, (size_t)count * sizeof( int ) );
+	b3Free( label, (size_t)count * sizeof( int ) );
+	b3Free( vox, (size_t)count * sizeof( int ) );
+}
+
+static void b3F_splitPiece( b3FractureWorld* fw, int piece, b3FractureReason reason )
+{
+	b3FracturePiece* P = fw->pieces.data + piece;
+	if ( P->hostOwned )
+	{
+		b3F_splitHostPiece( fw, piece, reason );
+		return;
+	}
 	int count = P->voxels.count;
 	if ( count == 0 )
 	{
@@ -1181,7 +1331,7 @@ static bool b3F_impactFracture( b3FractureWorld* fw, int piece )
 	b3Free( isSite, (size_t)fw->voxels.count );
 	b3Free( voxbuf, (size_t)count * sizeof( int ) );
 
-	b3F_splitPiece( fw, piece );
+	b3F_splitPiece( fw, piece, b3_fractureImpact );
 	fw->profSeverMs += b3GetMilliseconds( profTicks );
 	return true;
 }
@@ -1789,7 +1939,7 @@ static void b3F_severVoxelPiece( b3FractureWorld* fw, int piece, const b3F_Decis
 				b3F_sever( fw, v, f );
 		}
 	}
-	b3F_splitPiece( fw, piece );
+	b3F_splitPiece( fw, piece, b3_fractureStress );
 	fw->profSeverMs += b3GetMilliseconds( profTicks );
 }
 
@@ -2329,6 +2479,11 @@ void b3FractureWorld_Step( b3World* world, float dt )
 	fw->frame++;
 	fw->gravity = world->gravity;
 	fw->profSeverMs = 0.0f;
+
+	b3Array_Clear( fw->events );
+	b3Array_Clear( fw->eventCells );
+	b3Array_Clear( fw->eventCellStart );
+
 	uint64_t profT0 = b3GetTicks();
 
 	int stride = b3F_stride( fw );
@@ -2352,7 +2507,7 @@ void b3FractureWorld_Step( b3World* world, float dt )
 			b3FracturePiece* P = fw->pieces.data + p;
 			if ( !P->active )
 				continue;
-			if ( P->voxels.count < 2 && !P->isStatic )
+			if ( P->voxels.count < 2 && !P->isStatic && !P->hostOwned )
 				debrisLive++;
 			if ( P->kind == b3F_kindChunk && P->voxels.count < 2 )
 				continue; // inert: no interfaces left, nothing in the pipeline can affect it
@@ -2387,7 +2542,7 @@ void b3FractureWorld_Step( b3World* world, float dt )
 			b3FracturePiece* P = fw->pieces.data + p;
 			if ( !P->active )
 				continue;
-			if ( P->voxels.count < 2 && !P->isStatic )
+			if ( P->voxels.count < 2 && !P->isStatic && !P->hostOwned )
 				debrisLive++;
 			if ( P->kind == b3F_kindChunk && P->voxels.count < 2 )
 				continue; // inert: no interfaces left, nothing in the pipeline can affect it
@@ -2444,6 +2599,9 @@ void b3FractureWorld_Step( b3World* world, float dt )
 		fw->debrisHead = 0;
 	}
 
+	for ( int i = 0; i < fw->events.count; ++i )
+		fw->events.data[i].cells = fw->eventCells.data + fw->eventCellStart.data[i];
+
 	world->profile.fractureDebris = b3GetMilliseconds( profT2 );
 	world->profile.fracture = b3GetMilliseconds( profT0 );
 }
@@ -2467,6 +2625,9 @@ void b3FractureWorld_Destroy( b3World* world )
 	b3Array_Destroy( fw->chunkIfCount );
 	b3Array_Destroy( fw->chunkIfList );
 	b3Array_Destroy( fw->debrisQueue );
+	b3Array_Destroy( fw->events );
+	b3Array_Destroy( fw->eventCells );
+	b3Array_Destroy( fw->eventCellStart );
 	b3F_mapFree( &fw->cellToVox );
 	for ( int w = 0; w < B3_MAX_WORKERS; ++w )
 		for ( int i = 0; i < B3F_SC_COUNT; ++i )
@@ -3129,6 +3290,143 @@ int b3World_MakeBodyFracture( b3WorldId worldId, b3BodyId bodyId, b3FractureMate
 	b3Body_SetBullet( nb, bullet );
 	b3DestroyBody( bodyId );
 	return piece;
+}
+
+#define B3F_HOST_BIAS_STRIDE ( 1 << 13 ) // 8192 cells / axis of headroom per body
+#define B3F_HOST_BIAS_L 48				 // 48^3 = 110592 destructible bodies; 47*8192 < 2^20
+
+static b3Vec3i b3F_hostCellBias( int slot )
+{
+	int L = B3F_HOST_BIAS_L, S = B3F_HOST_BIAS_STRIDE;
+	return (b3Vec3i){ ( slot % L ) * S, ( ( slot / L ) % L ) * S, ( ( slot / ( L * L ) ) % L ) * S };
+}
+
+static int b3F_addHostVoxelBody( b3FractureWorld* fw, b3BodyId bodyId, b3ShapeId shapeId, const b3Vec3i* cells, int count,
+								 b3FractureMaterial material, const b3FractureDef* def )
+{
+	int matIdx = b3F_internMaterial( fw, material );
+	bool bodyStatic = b3Body_GetType( bodyId ) == b3_staticBody;
+	b3Vec3i bias = b3F_hostCellBias( fw->hostBindCount );
+
+	int* idx = (int*)b3Alloc( (size_t)count * sizeof( int ) );
+	int kept = 0;
+	int startVox = fw->voxels.count;
+	for ( int i = 0; i < count; ++i )
+	{
+		b3Vec3i gcell = { cells[i].x + bias.x, cells[i].y + bias.y, cells[i].z + bias.z };
+		uint64_t key = b3F_packCell( gcell );
+		int existing = b3F_mapGet( &fw->cellToVox, key );
+		if ( existing >= 0 && ( b3F_vox( fw, existing )->piece >= 0 || existing >= startVox ) )
+			continue; // duplicate within this call (biasing rules out cross-body collisions)
+
+		bool a = def->anchor ? def->anchor( cells[i], def->anchorContext ) : def->isStatic;
+		b3FractureVoxel vx = { 0 };
+		vx.cell = gcell;
+		vx.mat = matIdx;
+		vx.piece = -1;
+		vx.shape = shapeId;
+		vx.restOn = -1;
+		vx.anchor = a ? 1 : 0;
+		vx.local = ( b3Vec3 ){ cells[i].x * fw->voxel, cells[i].y * fw->voxel, cells[i].z * fw->voxel };
+		int id = fw->voxels.count;
+		b3Array_Push( fw->voxels, vx );
+		b3F_mapPut( &fw->cellToVox, key, id );
+		idx[kept++] = id;
+	}
+	if ( kept == 0 )
+	{
+		b3Free( idx, (size_t)count * sizeof( int ) );
+		return -1;
+	}
+
+	int p = b3F_allocPiece( fw );
+	b3FracturePiece* P = fw->pieces.data + p;
+	b3Array_Clear( P->voxels );
+	b3Array_Append( P->voxels, idx, kept );
+	P->body = bodyId;
+	P->voxelData = NULL; // host-owned geometry; freed by the host, not the fracture engine
+	P->localOffset = b3Vec3_zero;
+	P->kind = b3F_kindVoxel;
+	P->isStatic = (uint8_t)bodyStatic;
+	P->hostOwned = 1;
+	P->hostShape = shapeId;
+	P->cellBias = bias;
+	P->active = 1;
+	P->peakApproach = 0.0f;
+	P->overloadStreak = 0;
+	for ( int i = 0; i < kept; ++i )
+		b3F_vox( fw, idx[i] )->piece = p;
+
+	fw->hostBindCount++;
+	b3Free( idx, (size_t)count * sizeof( int ) );
+	return p;
+}
+
+int b3World_MakeVoxelBodyFracture( b3WorldId worldId, b3BodyId bodyId, b3FractureMaterial material, const b3FractureDef* def )
+{
+	b3World* world = b3GetWorldFromId( worldId );
+	if ( world == NULL || !b3Body_IsValid( bodyId ) )
+		return -1;
+
+	int nsh = b3Body_GetShapeCount( bodyId );
+	if ( nsh < 1 || nsh > 16 )
+		return -1;
+	b3ShapeId shapes[16];
+	int got = b3Body_GetShapes( bodyId, shapes, nsh );
+	b3ShapeId voxelShape = b3_nullShapeId;
+	int voxelShapeCount = 0;
+	for ( int i = 0; i < got; ++i )
+		if ( b3Shape_GetType( shapes[i] ) == b3_voxelShape )
+		{
+			voxelShape = shapes[i];
+			voxelShapeCount++;
+		}
+	if ( voxelShapeCount != 1 )
+		return -1; // must be exactly one voxel shape
+
+	const b3VoxelData* vd = b3GetShapeVoxelData( world, voxelShape );
+	if ( vd == NULL )
+		return -1;
+	float vs = b3VoxelData_GetVoxelSize( vd );
+	int cellCount = b3VoxelData_GetCellCount( vd );
+	if ( !( vs > 0.0f ) || cellCount <= 0 )
+		return -1;
+
+	b3FractureWorld* fw = (b3FractureWorld*)world->fractureWorld;
+	if ( fw == NULL )
+		fw = b3F_getOrCreate( world, worldId, vs, 0.0f );
+	if ( b3AbsFloat( fw->voxel - vs ) > 1e-6f * fw->voxel )
+		return -1;
+
+	for ( int p = 0; p < fw->pieces.count; ++p )
+		if ( fw->pieces.data[p].active && B3_ID_EQUALS( fw->pieces.data[p].body, bodyId ) )
+			return -1;
+
+	float shapeDensity = b3Shape_GetDensity( voxelShape );
+	if ( shapeDensity > 0.0f && material.density > 0.0f )
+	{
+		material.strength *= shapeDensity / material.density;
+		material.density = shapeDensity;
+	}
+
+	b3Vec3i* cells = (b3Vec3i*)b3Alloc( (size_t)cellCount * sizeof( b3Vec3i ) );
+	int n = b3VoxelData_GetCells( vd, cells, cellCount );
+	b3FractureDef local = def ? *def : b3DefaultFractureDef();
+	int piece = b3F_addHostVoxelBody( fw, bodyId, voxelShape, cells, n, material, &local );
+	b3Free( cells, (size_t)cellCount * sizeof( b3Vec3i ) );
+	return piece;
+}
+
+b3FractureEvents b3World_GetFractureEvents( b3WorldId worldId )
+{
+	b3World* world = b3GetWorldFromId( worldId );
+	if ( world == NULL || world->fractureWorld == NULL )
+		return ( b3FractureEvents ){ 0 };
+	b3FractureWorld* fw = (b3FractureWorld*)world->fractureWorld;
+	b3FractureEvents ev;
+	ev.events = fw->events.data;
+	ev.count = fw->events.count;
+	return ev;
 }
 
 void b3World_ApplyFractureColors( b3WorldId worldId, b3FractureColorMode mode )
