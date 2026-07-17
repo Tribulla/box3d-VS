@@ -3,6 +3,8 @@
 #include "test_macros.h"
 
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 static b3WorldId FractureMakeWorld( void )
 {
@@ -818,6 +820,77 @@ static int VoxelShapeTwoBodiesIndependentFracture( void )
 	b3DestroyWorld( worldId );
 	b3DestroyVoxelData( vdA );
 	b3DestroyVoxelData( vdB );
+	return 0;
+}
+
+// Opt-in perf harness (VOX_PERF=1): a big settled pile of small voxel fracture cubes, stepped
+// single-threaded, with the profile sections averaged over a measurement window. Deterministic
+// and low-noise for A/B optimisation. Run: VOX_PERF=1 test.exe VoxelPerfTest  (VOX_PERF_N=side).
+int VoxelPerfTest( void )
+{
+	if ( getenv( "VOX_PERF" ) == NULL )
+		return 0; // skipped in the normal suite
+
+	int side = getenv( "VOX_PERF_N" ) ? atoi( getenv( "VOX_PERF_N" ) ) : 20;
+	int layers = getenv( "VOX_PERF_L" ) ? atoi( getenv( "VOX_PERF_L" ) ) : 15;
+	int warm = getenv( "VOX_PERF_WARM" ) ? atoi( getenv( "VOX_PERF_WARM" ) ) : 150;
+	int meas = getenv( "VOX_PERF_MEAS" ) ? atoi( getenv( "VOX_PERF_MEAS" ) ) : 150;
+
+	b3WorldDef wd = b3DefaultWorldDef();
+	wd.gravity = ( b3Vec3 ){ 0.0f, -9.81f, 0.0f };
+	b3WorldId world = b3CreateWorld( &wd );
+	b3World_EnableFracture( world, 1.0f, 0.0f );
+
+	b3BodyDef gd = b3DefaultBodyDef();
+	gd.position = ( b3Pos ){ 0.0f, -1.0f, 0.0f };
+	b3BodyId g = b3CreateBody( world, &gd );
+	b3ShapeDef gsd = b3DefaultShapeDef();
+	b3BoxHull gh = b3MakeBoxHull( 400.0f, 1.0f, 400.0f );
+	b3CreateHullShape( g, &gsd, &gh.base );
+
+	b3FractureMaterial mat = b3GetFractureMaterial( b3_fractureMetal );
+	b3FractureDef def = b3DefaultFractureDef();
+	int cubes = 0;
+	for ( int gx = 0; gx < side; ++gx )
+		for ( int gz = 0; gz < side; ++gz )
+			for ( int gy = 0; gy < layers; ++gy )
+			{
+				int ox = gx * 3, oy = 1 + gy * 3, oz = gz * 3;
+				b3Vec3i cells[8];
+				int k = 0;
+				for ( int x = 0; x < 2; ++x )
+					for ( int y = 0; y < 2; ++y )
+						for ( int z = 0; z < 2; ++z )
+							cells[k++] = ( b3Vec3i ){ ox + x, oy + y, oz + z };
+				b3World_CreateFractureVoxels( world, cells, 8, mat, &def );
+				cubes++;
+			}
+
+	float dt = 1.0f / 60.0f;
+	for ( int i = 0; i < warm; ++i )
+		b3World_Step( world, dt, 4 );
+
+	double sStep = 0, sColl = 0, sSolve = 0, sConstr = 0, sFrac = 0, sGather = 0, sAnalyze = 0, sPairs = 0;
+	for ( int i = 0; i < meas; ++i )
+	{
+		b3World_Step( world, dt, 4 );
+		b3Profile p = b3World_GetProfile( world );
+		sStep += p.step;
+		sColl += p.collide;
+		sSolve += p.solve;
+		sConstr += p.constraints;
+		sFrac += p.fracture;
+		sGather += p.fractureGather;
+		sAnalyze += p.fractureAnalyze;
+		sPairs += p.pairs;
+	}
+	b3Counters c = b3World_GetCounters( world );
+	double inv = 1.0 / (double)meas;
+	printf( "[VOX_PERF] cubes=%d bodies=%d contacts=%d | avg/%d steps: step=%.3f pairs=%.3f collide=%.3f solve=%.3f "
+			"constr=%.3f frac=%.3f (gather=%.3f analyze=%.3f)\n",
+			cubes, c.bodyCount, c.contactCount, meas, sStep * inv, sPairs * inv, sColl * inv, sSolve * inv, sConstr * inv,
+			sFrac * inv, sGather * inv, sAnalyze * inv );
+	b3DestroyWorld( world );
 	return 0;
 }
 

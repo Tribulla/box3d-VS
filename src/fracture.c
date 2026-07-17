@@ -172,19 +172,20 @@ static void b3F_mapFree( b3F_Map* m )
 
 typedef struct b3FractureVoxel
 {
-	b3Vec3i cell;
-	int mat;
 	int piece; // -1 = destroyed
-	b3Vec3 local;
-	b3ShapeId shape;
-	float stress;		// this frame's raw computed failure ratio (drives the display EMA)
-	float stressShown;	// temporally smoothed value used for colouring; frozen when the body sleeps
 	b3Vec3 force;	 // EMA-smoothed contact force (section analysis)
 	b3Vec3 forceRaw; // this frame's raw contact force (local impact)
 	int restOn;		 // -1 none, -2 static/fixed support, else a dynamic body key
 	uint8_t restOnAge;	 // frames restOn stays latched after the last contact (jitter smoothing)
 	uint8_t anchor;
 	uint8_t brokenFaces; // bitmask of severed face-bonds
+
+	b3Vec3i cell;
+	int mat;
+	b3Vec3 local;
+	b3ShapeId shape;
+	float stress;	   // this frame's raw computed failure ratio (drives the display EMA)
+	float stressShown; // temporally smoothed value used for colouring; frozen when the body sleeps
 } b3FractureVoxel;
 
 b3DeclareArrayNative( b3FractureVoxel );
@@ -239,8 +240,9 @@ typedef struct b3FracturePiece
 	uint8_t debris;
 	uint8_t merge;
 	uint8_t active;
-	uint8_t hostOwned;
-	b3Vec3i cellBias;
+	uint8_t hostOwned;	 // 1 = wraps a host body's existing b3_voxelShape (analysis-only; host materialises fragments)
+	b3ShapeId hostShape; // the host b3_voxelShape to mutate in place on sever (hostOwned only)
+	b3Vec3i cellBias;	 // host pieces: shift body-LOCAL cells into a unique global cellToVox slot (0 for engine)
 	float peakApproach;
 	int overloadStreak;
 } b3FracturePiece;
@@ -336,6 +338,7 @@ typedef struct b3FractureWorld
 	b3Array( int ) eventCellStart;
 	uint64_t nextFragmentId;
 	int hostBindCount; // number of host bodies bound so far; assigns each a unique cellBias lattice slot
+
 	float profSeverMs; // this step's sever/split time (b3Profile.fractureSever), reset each step
 
 	b3F_Buf scratch[B3_MAX_WORKERS][B3F_SC_COUNT];
@@ -1191,48 +1194,42 @@ static void b3F_gatherContactForces( b3World* world, b3FractureWorld* fw, float 
 {
 	for ( int p = 0; p < fw->pieces.count; ++p )
 		fw->pieces.data[p].peakApproach = 0.0f;
-	for ( int v = 0; v < fw->voxels.count; ++v )
-		if ( fw->voxels.data[v].piece >= 0 )
-		{
 			// Latch support for a few frames: aggregated voxel manifolds drop and
 			// re-form contact points frame-to-frame, so a hard reset would make a
 			// resting face's support set flicker and spuriously fracture the body.
-			b3FractureVoxel* vx = fw->voxels.data + v;
-			if ( vx->restOnAge > 0 )
-				vx->restOnAge--;
-			if ( vx->restOnAge == 0 )
-				vx->restOn = -1;
-			vx->forceRaw = b3Vec3_zero;
-		}
-	for ( int c = 0; c < fw->chunks.count; ++c )
-		if ( fw->chunks.data[c].piece >= 0 )
-		{
-			fw->chunks.data[c].restOn = -1;
-			fw->chunks.data[c].forceRaw = b3Vec3_zero;
-		}
-	if ( !fw->tuning.contactStress )
-	{
-		for ( int v = 0; v < fw->voxels.count; ++v )
-			if ( fw->voxels.data[v].piece >= 0 )
-				fw->voxels.data[v].force = b3Vec3_zero;
-		for ( int c = 0; c < fw->chunks.count; ++c )
-			if ( fw->chunks.data[c].piece >= 0 )
-				fw->chunks.data[c].force = b3Vec3_zero;
-		return;
-	}
 
-	float gmag = b3Length( fw->gravity );
-	b3Vec3 gUp = ( gmag > B3F_EPS ) ? b3MulSV( -1.0f / gmag, fw->gravity ) : (b3Vec3){ 0, 1, 0 };
+	bool contactStress = fw->tuning.contactStress;
 	float a = fw->tuning.contactSmoothing;
 	if ( a <= 0.0f || a > 1.0f )
 		a = 1.0f;
+	float forceKeep = contactStress ? ( 1.0f - a ) : 0.0f;
 
 	for ( int v = 0; v < fw->voxels.count; ++v )
-		if ( fw->voxels.data[v].piece >= 0 )
-			fw->voxels.data[v].force = b3MulSV( 1.0f - a, fw->voxels.data[v].force );
+	{
+		b3FractureVoxel* vx = fw->voxels.data + v;
+		if ( vx->piece < 0 )
+			continue;
+		if ( vx->restOnAge > 0 )
+			vx->restOnAge--;
+		if ( vx->restOnAge == 0 )
+			vx->restOn = -1;
+		vx->forceRaw = b3Vec3_zero;
+		vx->force = b3MulSV( forceKeep, vx->force );
+	}
 	for ( int c = 0; c < fw->chunks.count; ++c )
-		if ( fw->chunks.data[c].piece >= 0 )
-			fw->chunks.data[c].force = b3MulSV( 1.0f - a, fw->chunks.data[c].force );
+	{
+		b3F_Chunk* ch = fw->chunks.data + c;
+		if ( ch->piece < 0 )
+			continue;
+		ch->restOn = -1;
+		ch->forceRaw = b3Vec3_zero;
+		ch->force = b3MulSV( forceKeep, ch->force );
+	}
+	if ( !contactStress )
+		return;
+
+	float gmag = b3Length( fw->gravity );
+	b3Vec3 gUp = ( gmag > B3F_EPS ) ? b3MulSV( -1.0f / gmag, fw->gravity ) : (b3Vec3){ 0, 1, 0 };
 
 	if ( fw->tuning.parallelAnalysis && world->workerCount > 1 )
 	{

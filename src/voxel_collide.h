@@ -28,6 +28,6 @@ int b3VoxelCollideOBB( const b3VoxelOBB* box0, const b3VoxelOBB* box1, float con
 int b3VoxelCollideAABB( const b3AABB* box0, const b3AABB* box1, float contactDistance, int maxContacts, b3VoxelContact* out );
 
 int b3VoxelCollide( const b3VoxelData* v0, b3Transform xf0, const b3VoxelData* v1, b3Transform xf1, float contactDistance,
-					int maxContacts, b3VoxelContact* out );
+					int maxContacts, b3VoxelContact* out, struct b3Arena* arena );
 
 void b3Voxel_addReduced( const b3VoxelContact* c, b3VoxelContact* acc, int* nacc, int maxContacts );

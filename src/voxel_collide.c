@@ -1,5 +1,6 @@
 #include "voxel_collide.h"
 
+#include "arena_allocator.h" // b3Bump (per-pair cell scratch)
 #include "core.h"
 #include "shape.h"
 #include "voxel_shape.h"
@@ -441,6 +442,18 @@ static b3VoxelOBB b3Voxel_cellOBB( b3Vec3i cell, float voxelSize, b3Transform xf
 	return o;
 }
 
+static inline b3VoxelOBB b3Voxel_cellOBBAxes( b3Vec3i cell, float voxelSize, b3Transform xf, const b3Vec3* axes, b3Vec3 half )
+{
+	b3VoxelOBB o;
+	b3Vec3 localCenter = { cell.x * voxelSize, cell.y * voxelSize, cell.z * voxelSize };
+	o.center = b3Voxel_xfPoint( xf, localCenter );
+	o.axes[0] = axes[0];
+	o.axes[1] = axes[1];
+	o.axes[2] = axes[2];
+	o.half = half;
+	return o;
+}
+
 static b3Vec3i b3Voxel_dominantOffset( b3Vec3 d )
 {
 	float ax = b3AbsFloat( d.x ), ay = b3AbsFloat( d.y ), az = b3AbsFloat( d.z );
@@ -544,7 +557,7 @@ static void b3Voxel_order( b3VoxelContact* c, int n )
 }
 
 int b3VoxelCollide( const b3VoxelData* v0, b3Transform xf0, const b3VoxelData* v1, b3Transform xf1, float contactDistance,
-					int maxContacts, b3VoxelContact* out )
+					int maxContacts, b3VoxelContact* out, struct b3Arena* arena )
 {
 	if ( maxContacts < 1 )
 		return 0;
@@ -565,12 +578,22 @@ int b3VoxelCollide( const b3VoxelData* v0, b3Transform xf0, const b3VoxelData* v
 	float vs0 = b3Voxel_GetVoxelSize( v0 );
 	float vs1 = b3Voxel_GetVoxelSize( v1 );
 
+	b3Vec3 axes0[3] = { b3RotateVector( xf0.q, ( b3Vec3 ){ 1.0f, 0.0f, 0.0f } ),
+						b3RotateVector( xf0.q, ( b3Vec3 ){ 0.0f, 1.0f, 0.0f } ),
+						b3RotateVector( xf0.q, ( b3Vec3 ){ 0.0f, 0.0f, 1.0f } ) };
+	b3Vec3 axes1[3] = { b3RotateVector( xf1.q, ( b3Vec3 ){ 1.0f, 0.0f, 0.0f } ),
+						b3RotateVector( xf1.q, ( b3Vec3 ){ 0.0f, 1.0f, 0.0f } ),
+						b3RotateVector( xf1.q, ( b3Vec3 ){ 0.0f, 0.0f, 1.0f } ) };
+	b3Vec3 half0 = { 0.5f * vs0, 0.5f * vs0, 0.5f * vs0 };
+	b3Vec3 half1 = { 0.5f * vs1, 0.5f * vs1, 0.5f * vs1 };
+
 	// Solid cells of v0 in the region v1 could reach.
 	b3AABB q0 = b3Voxel_mapBounds( b3Voxel_expandB( wb1, contactDistance ), xf0, true );
 	int cap0 = b3Voxel_GetCellCount( v0 );
 	if ( cap0 > 8192 )
 		cap0 = 8192;
-	b3Vec3i* cells0 = (b3Vec3i*)b3Alloc( (size_t)cap0 * sizeof( b3Vec3i ) );
+	int cells0Bytes = cap0 * (int)sizeof( b3Vec3i );
+	b3Vec3i* cells0 = arena ? (b3Vec3i*)b3Bump( arena, cells0Bytes ) : (b3Vec3i*)b3Alloc( (size_t)cells0Bytes );
 	int nc0 = b3Voxel_QueryCells( v0, q0, cells0, cap0 );
 
 	b3VoxelContact acc[B3_VOXEL_MAX_CONTACTS];
@@ -579,14 +602,14 @@ int b3VoxelCollide( const b3VoxelData* v0, b3Transform xf0, const b3VoxelData* v
 
 	for ( int a = 0; a < nc0; ++a )
 	{
-		b3VoxelOBB obb0 = b3Voxel_cellOBB( cells0[a], vs0, xf0 );
+		b3VoxelOBB obb0 = b3Voxel_cellOBBAxes( cells0[a], vs0, xf0, axes0, half0 );
 		b3AABB ewb0 = b3Voxel_expandB( b3VoxelOBB_Bounds( &obb0 ), contactDistance );
 		b3AABB q1 = b3Voxel_mapBounds( ewb0, xf1, true );
 		int nc1 = b3Voxel_QueryCells( v1, q1, cells1, 256 );
 
 		for ( int b = 0; b < nc1; ++b )
 		{
-			b3VoxelOBB obb1 = b3Voxel_cellOBB( cells1[b], vs1, xf1 );
+			b3VoxelOBB obb1 = b3Voxel_cellOBBAxes( cells1[b], vs1, xf1, axes1, half1 );
 			if ( !b3Voxel_isect( ewb0, b3VoxelOBB_Bounds( &obb1 ) ) )
 				continue;
 
@@ -598,17 +621,18 @@ int b3VoxelCollide( const b3VoxelData* v0, b3Transform xf0, const b3VoxelData* v
 			// corners reach the true face edges, restoring a full-width support base. Edge and
 			// deep-overlap contacts still fall back to the single-point branch inside CollideOBB.
 			int nc = b3VoxelCollideOBB( &obb0, &obb1, contactDistance, 4, c );
+			if ( nc > 0 && !b3Voxel_facesExposed( v0, cells0[a], xf0, v1, cells1[b], xf1, c[0].normal ) )
+				continue;
 			for ( int k = 0; k < nc; ++k )
 			{
-				if ( !b3Voxel_facesExposed( v0, cells0[a], xf0, v1, cells1[b], xf1, c[k].normal ) )
-					continue;
 				c[k].featureId = b3Voxel_pairId( cells0[a], cells1[b], k );
 				b3Voxel_addReduced( &c[k], acc, &nacc, maxContacts );
 			}
 		}
 	}
 
-	b3Free( cells0, (size_t)cap0 * sizeof( b3Vec3i ) );
+	if ( !arena )
+		b3Free( cells0, (size_t)cells0Bytes );
 
 	b3Voxel_order( acc, nacc );
 	for ( int i = 0; i < nacc; ++i )

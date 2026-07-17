@@ -155,7 +155,8 @@ void b3PrepareContacts_Mesh( b3SolverBlock block, b3StepContext* context )
 			contactConstraint->invMassA = mA;
 			contactConstraint->invIB = iB;
 			contactConstraint->invMassB = mB;
-			contactConstraint->rollingMass = b3InvertMatrix( b3AddMM( iA, iB ) );
+			contactConstraint->rollingMass =
+				contact->rollingResistance > 0.0f ? b3InvertMatrix( b3AddMM( iA, iB ) ) : b3Mat3_zero;
 			contactConstraint->softness =
 				( contact->flags & b3_contactStaticFlag ) != 0 ? context->staticSoftness : context->contactSoftness;
 			contactConstraint->friction = contact->friction;

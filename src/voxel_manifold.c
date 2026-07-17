@@ -365,7 +365,7 @@ bool b3ComputeVoxelManifolds( b3World* world, int workerIndex, b3Contact* contac
 	if ( shapeB->type == b3_voxelShape )
 	{
 		count = b3VoxelCollide( shapeA->voxel, b3Transform_identity, shapeB->voxel, transformBtoA, contactDistance,
-								B3_VOXEL_MAX_CONTACTS, contacts );
+								B3_VOXEL_MAX_CONTACTS, contacts, &arena );
 	}
 	else
 	{

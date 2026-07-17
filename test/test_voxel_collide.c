@@ -262,13 +262,13 @@ static int VoxelDriverBasic( void )
 	b3VoxelContact out[64];
 
 	b3Transform x0 = { { 0.8f, 0.0f, 0.0f }, b3Quat_identity };
-	int n = b3VoxelCollide( v0, x0, v1, x1, 0.0f, 64, out );
+	int n = b3VoxelCollide( v0, x0, v1, x1, 0.0f, 64, out , NULL );
 	ENSURE( n >= 1 );
 	ENSURE_SMALL( out[0].normal.x - 1.0f, 1e-3f );
 	ENSURE_SMALL( out[0].initialPenetration - 0.2f, 1e-3f );
 
 	b3Transform xf = { { 3.0f, 0.0f, 0.0f }, b3Quat_identity };
-	ENSURE( b3VoxelCollide( v0, xf, v1, x1, 0.0f, 64, out ) == 0 );
+	ENSURE( b3VoxelCollide( v0, xf, v1, x1, 0.0f, 64, out , NULL ) == 0 );
 
 	b3DestroyVoxelData( v0 );
 	b3DestroyVoxelData( v1 );
@@ -287,7 +287,7 @@ static int VoxelDriverSlab( void )
 	b3Transform x0 = { { 0.0f, 0.0f, 0.0f }, b3Quat_identity };
 	b3Transform x1 = { { 0.0f, 0.9f, 0.0f }, b3Quat_identity };
 	b3VoxelContact out[64];
-	int cnt = b3VoxelCollide( v0, x0, v1, x1, 0.0f, 64, out );
+	int cnt = b3VoxelCollide( v0, x0, v1, x1, 0.0f, 64, out , NULL );
 	ENSURE( cnt >= 4 ); // a spread resting manifold, not a single point
 	ENSURE_SMALL( out[0].normal.y - ( -1.0f ), 1e-3f );	 // B (above) -> A (below) = -y
 	ENSURE_SMALL( out[0].initialPenetration - 0.1f, 1e-3f );
@@ -305,6 +305,7 @@ static int VoxelDriverSlab( void )
 static int VoxelDriverOracle( void )
 {
 	s_rng = 0xC0FFEEu;
+	// v0 = 3x3x3 cube (27 cells), v1 = 2x2x2 cube (8 cells).
 	b3Vec3i c0[27];
 	int n0 = 0;
 	for ( int x = 0; x < 3; ++x )
@@ -331,7 +332,7 @@ static int VoxelDriverOracle( void )
 		int op = OraclePairs( c0, n0, x0, c1, n1, x1, &mp );
 
 		b3VoxelContact out[64];
-		int n = b3VoxelCollide( v0, x0, v1, x1, 0.0f, 64, out );
+		int n = b3VoxelCollide( v0, x0, v1, x1, 0.0f, 64, out , NULL );
 
 		if ( op == 0 )
 		{
@@ -435,7 +436,7 @@ static int VoxelContactSpread( void )
 	b3Transform x1 = { { 0.0f, 0.95f, 0.0f }, b3Quat_identity }; // 0.05 overlap in y
 
 	b3VoxelContact out[64];
-	int cnt = b3VoxelCollide( v0, x0, v1, x1, 0.0f, 64, out );
+	int cnt = b3VoxelCollide( v0, x0, v1, x1, 0.0f, 64, out , NULL );
 	ENSURE( cnt >= 4 );
 
 	float minX = FLT_MAX, maxX = -FLT_MAX, minZ = FLT_MAX, maxZ = -FLT_MAX;

@@ -670,6 +670,145 @@ public:
 	}
 };
 
+class CollisionVoxelSmash : public VoxelCollisionSample
+{
+public:
+	explicit CollisionVoxelSmash( SampleContext* context )
+		: VoxelCollisionSample( context )
+	{
+		m_sceneName = "voxel_smash";
+		Boot();
+	}
+
+	void SetupCamera() override
+	{
+		m_camera->SetView( -30.0f, 14.0f, 42.0f, { 0.0f, 6.0f, 0.0f } );
+	}
+
+	void BuildScene() override
+	{
+		m_wall = b3_nullBodyId;
+		m_fractureOn = false;
+		m_autoFired = false;
+		m_fragmentsSpawned = 0;
+		m_lastEventCells = 0;
+		m_lastEventMass = 0.0f;
+
+		AddFlatGround( 20, 20, 2 );
+
+		std::vector<b3Vec3i> cells;
+		for ( int x = -10; x < 10; ++x )
+			for ( int y = 0; y < 12; ++y )
+				for ( int z = -1; z <= 0; ++z )
+					cells.push_back( b3Vec3i{ x, y, z } );
+		m_wall = AddVoxelBody( cells, { 0.0f, 0.5f, 0.0f }, true, 0xB35442u );
+
+		if ( m_mode == VOX_MODE_VOXELSHAPE && B3_IS_NON_NULL( m_wall ) )
+		{
+			b3World_EnableFracture( m_worldId, m_voxel, 0.0f );
+			b3FractureTuning t = b3World_GetFractureTuning( m_worldId );
+			t.warmupFrames = 5;
+			b3World_SetFractureTuning( m_worldId, t );
+			int piece = b3World_MakeVoxelBodyFracture( m_worldId, m_wall, b3GetFractureMaterial( b3_fractureGlass ), nullptr );
+			m_fractureOn = piece >= 0;
+		}
+	}
+
+	void FireBall()
+	{
+		b3BodyDef bd = b3DefaultBodyDef();
+		bd.type = b3_dynamicBody;
+		bd.position = b3ToPos( { 0.0f, 6.0f, 22.0f } );
+		bd.linearVelocity = { 0.0f, 0.0f, -70.0f };
+		bd.isBullet = true;
+		b3BodyId ball = b3CreateBody( m_worldId, &bd );
+		m_dynamicBodies.push_back( ball );
+
+		std::vector<b3Vec3i> cells;
+		AppendVoxelSphere( cells, 0, 0, 0, 2 ); // a blocky ball ~2 cells in radius
+		b3VoxelData* vd = b3CreateVoxelData( cells.data(), (int)cells.size(), m_voxel );
+		m_voxelData.push_back( vd );
+		b3ShapeDef sd = b3DefaultShapeDef();
+		sd.density = 6.0f;
+		sd.enableContactEvents = true;
+		sd.baseMaterial.customColor = 0xF0F0F0u;
+		b3CreateVoxelShape( ball, &sd, vd );
+	}
+
+	void MaterialiseFragment( const b3FractureEvent& e )
+	{
+		if ( e.cellCount <= 0 )
+			return;
+		b3WorldTransform parentXf = b3Body_GetTransform( e.parentBody );
+		b3Vec3 origin = b3ToVec3( parentXf.p );
+
+		b3BodyDef bd = b3DefaultBodyDef();
+		bd.type = b3_dynamicBody;
+		bd.position = parentXf.p; // fragment cells reuse the parent's coords + pose
+		bd.rotation = parentXf.q;
+		bd.linearVelocity = b3Add( e.linearVelocity, b3Cross( e.angularVelocity, b3Sub( origin, e.centerOfMassWorld ) ) );
+		bd.angularVelocity = e.angularVelocity;
+		b3BodyId frag = b3CreateBody( m_worldId, &bd );
+		m_dynamicBodies.push_back( frag );
+
+		b3VoxelData* vd = b3CreateVoxelData( e.cells, e.cellCount, m_voxel );
+		m_voxelData.push_back( vd ); // freed by FreeVoxelData on teardown / rebuild
+		b3ShapeDef sd = b3DefaultShapeDef();
+		sd.enableContactEvents = true;
+		sd.baseMaterial.customColor = 0xC86040u;
+		b3CreateVoxelShape( frag, &sd, vd );
+
+		m_fragmentsSpawned++;
+		m_lastEventCells = e.cellCount;
+		m_lastEventMass = e.mass;
+	}
+
+	void Step() override
+	{
+		VoxelCollisionSample::Step(); // runs the world step + base HUD
+
+		if ( m_fractureOn && m_didStep )
+		{
+			if ( !m_autoFired && m_stepCount > 40 )
+			{
+				FireBall();
+				m_autoFired = true;
+			}
+			b3FractureEvents ev = b3World_GetFractureEvents( m_worldId );
+			for ( int i = 0; i < ev.count; ++i )
+				MaterialiseFragment( ev.events[i] );
+		}
+	}
+
+	void Keyboard( int key, int action, int mods ) override
+	{
+		if ( action == ACTION_PRESS && key == KEY_B )
+			FireBall();
+		else
+			VoxelCollisionSample::Keyboard( key, action, mods );
+	}
+
+	void ExtraHud() override
+	{
+		if ( m_mode != VOX_MODE_VOXELSHAPE )
+		{
+			DrawTextLine( "Voxel Smash: switch to b3_voxelShape mode (V) for destructible fracture" );
+			return;
+		}
+		DrawTextLine( "Destructible voxel wall %s | fragments materialised from events: %d", m_fractureOn ? "ON" : "off",
+					  m_fragmentsSpawned );
+		DrawTextLine( "last event: %d cells, mass %.2f   |   B: fire ball", m_lastEventCells, m_lastEventMass );
+	}
+
+private:
+	b3BodyId m_wall = b3_nullBodyId;
+	bool m_fractureOn = false;
+	bool m_autoFired = false;
+	int m_fragmentsSpawned = 0;
+	int m_lastEventCells = 0;
+	float m_lastEventMass = 0.0f;
+};
+
 #define COLLISION_SAMPLE( Class, name )                                                                                \
 	static Sample* Create##Class( SampleContext* context )                                                             \
 	{                                                                                                                  \
@@ -685,3 +824,4 @@ COLLISION_SAMPLE( CollisionExactFit, "Exact Fit (slot)" );
 COLLISION_SAMPLE( CollisionShapeStack, "Shape Stack" );
 COLLISION_SAMPLE( CollisionPile, "Voxel Pile (scale)" );
 COLLISION_SAMPLE( CollisionConvexDrop, "Convex Drop" );
+COLLISION_SAMPLE( CollisionVoxelSmash, "Voxel Smash" );
