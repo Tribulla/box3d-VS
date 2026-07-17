@@ -92,6 +92,9 @@ const b3VoxelData* b3GetShapeVoxelData( b3World* world, b3ShapeId shapeId );
 
 void b3Shape_RemoveVoxelCells( b3World* world, b3ShapeId shapeId, const b3Vec3i* cells, int count );
 
+void b3Shape_AddVoxelCells( b3World* world, b3ShapeId shapeId, const b3Vec3i* cells, const uint16_t* geomIndices,
+							int count );
+
 // Conservative world AABB for a shape inflated by extra margin. In double precision mode the
 // box is built in the body local frame, translated by the double origin, and rounded outward.
 b3AABB b3ComputeFatShapeAABB( const b3Shape* shape, b3WorldTransform transform, float extra );

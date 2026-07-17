@@ -616,6 +616,53 @@ void b3Shape_RemoveVoxelCells( b3World* world, b3ShapeId shapeId, const b3Vec3i*
 	b3UpdateBodyMassData( world, body );
 }
 
+void b3Shape_AddVoxelCells( b3World* world, b3ShapeId shapeId, const b3Vec3i* cells, const uint16_t* geomIndices,
+							int count )
+{
+	if ( world == NULL || count <= 0 )
+		return;
+	b3Shape* shape = b3GetShape( world, shapeId );
+	if ( shape == NULL || shape->type != b3_voxelShape )
+		return;
+
+	b3Voxel_AddCellsEx( (b3VoxelData*)shape->voxel, cells, geomIndices, count );
+
+	// Refresh the shape-local derived fields the same way shape creation does.
+	shape->localCentroid = b3GetShapeCentroid( shape );
+	shape->aabbMargin = b3ComputeShapeMargin( shape );
+
+	b3Body* body = b3Array_Get( world->bodies, shape->bodyId );
+	b3WorldTransform transform = b3GetBodyTransformQuick( world, body );
+	if ( shape->proxyKey != B3_NULL_INDEX )
+	{
+		b3BodyType proxyType = B3_PROXY_TYPE( shape->proxyKey );
+		b3UpdateShapeAABBs( shape, transform, proxyType );
+		b3BroadPhase_MoveProxy( &world->broadPhase, shape->proxyKey, shape->fatAABB );
+	}
+	else
+	{
+		b3UpdateShapeAABBs( shape, transform, body->type );
+	}
+
+	b3UpdateBodyMassData( world, body );
+}
+
+void b3VoxelShape_AddCells( b3ShapeId shapeId, const b3Vec3i* cells, const uint16_t* geomIndices, int count )
+{
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL )
+		return;
+	b3Shape_AddVoxelCells( world, shapeId, cells, geomIndices, count );
+}
+
+void b3VoxelShape_RemoveCells( b3ShapeId shapeId, const b3Vec3i* cells, int count )
+{
+	b3World* world = b3GetUnlockedWorld( shapeId.world0 );
+	if ( world == NULL )
+		return;
+	b3Shape_RemoveVoxelCells( world, shapeId, cells, count );
+}
+
 b3AABB b3ComputeShapeAABB( const b3Shape* shape, b3Transform transform )
 {
 	switch ( shape->type )

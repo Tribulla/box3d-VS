@@ -21,6 +21,14 @@ b3MassData b3Voxel_ComputeMass( const b3VoxelData* v, float density );
 
 void b3Voxel_RemoveCells( b3VoxelData* v, const b3Vec3i* cells, int count );
 
+void b3Voxel_AddCells( b3VoxelData* v, const b3Vec3i* cells, int count );
+
+void b3Voxel_AddCellsEx( b3VoxelData* v, const b3Vec3i* cells, const uint16_t* geomIndices, int count );
+
+const b3VoxelSubBox* b3Voxel_geomBoxesFor( const b3VoxelData* v, int geomIndex, int* countOut );
+
+int b3Voxel_cellGeomIndex( const b3VoxelData* v, b3Vec3i cell );
+
 b3CastOutput b3RayCastVoxel( const b3VoxelData* v, const b3RayCastInput* input );
 
 bool b3OverlapVoxel( const b3VoxelData* v, b3Transform xf, const b3ShapeProxy* proxy );

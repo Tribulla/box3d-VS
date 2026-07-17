@@ -454,6 +454,20 @@ static inline b3VoxelOBB b3Voxel_cellOBBAxes( b3Vec3i cell, float voxelSize, b3T
 	return o;
 }
 
+static inline b3VoxelOBB b3Voxel_cellSubOBBAxes( b3Vec3i cell, float voxelSize, b3Transform xf, const b3Vec3* axes,
+												 const b3VoxelSubBox* sb )
+{
+	b3VoxelOBB o;
+	b3Vec3 localCenter = { cell.x * voxelSize + sb->center.x, cell.y * voxelSize + sb->center.y,
+						   cell.z * voxelSize + sb->center.z };
+	o.center = b3Voxel_xfPoint( xf, localCenter );
+	o.axes[0] = axes[0];
+	o.axes[1] = axes[1];
+	o.axes[2] = axes[2];
+	o.half = sb->halfExtents;
+	return o;
+}
+
 static b3Vec3i b3Voxel_dominantOffset( b3Vec3 d )
 {
 	float ax = b3AbsFloat( d.x ), ay = b3AbsFloat( d.y ), az = b3AbsFloat( d.z );
@@ -607,26 +621,45 @@ int b3VoxelCollide( const b3VoxelData* v0, b3Transform xf0, const b3VoxelData* v
 		b3AABB q1 = b3Voxel_mapBounds( ewb0, xf1, true );
 		int nc1 = b3Voxel_QueryCells( v1, q1, cells1, 256 );
 
+		int ng0 = 0;
+		const b3VoxelSubBox* sb0 = b3Voxel_geomBoxesFor( v0, b3Voxel_cellGeomIndex( v0, cells0[a] ), &ng0 );
+		int n0 = sb0 != NULL ? ng0 : 1;
+
 		for ( int b = 0; b < nc1; ++b )
 		{
 			b3VoxelOBB obb1 = b3Voxel_cellOBBAxes( cells1[b], vs1, xf1, axes1, half1 );
 			if ( !b3Voxel_isect( ewb0, b3VoxelOBB_Bounds( &obb1 ) ) )
 				continue;
 
-			b3VoxelContact c[4];
 			// Request the face-clip manifold (up to 4 corner points) per voxel pair, not a single
 			// support point. A single point lands at the voxel FACE CENTRE, so an N-wide resting
 			// face gets a support polygon of span (N-1)*voxelSize and a single-voxel contact
 			// collapses to one central point with ZERO base -> free to rock/tip. The clipped
 			// corners reach the true face edges, restoring a full-width support base. Edge and
 			// deep-overlap contacts still fall back to the single-point branch inside CollideOBB.
-			int nc = b3VoxelCollideOBB( &obb0, &obb1, contactDistance, 4, c );
-			if ( nc > 0 && !b3Voxel_facesExposed( v0, cells0[a], xf0, v1, cells1[b], xf1, c[0].normal ) )
-				continue;
-			for ( int k = 0; k < nc; ++k )
+			int ng1 = 0;
+			const b3VoxelSubBox* sb1 = b3Voxel_geomBoxesFor( v1, b3Voxel_cellGeomIndex( v1, cells1[b] ), &ng1 );
+			int n1 = sb1 != NULL ? ng1 : 1;
+
+			for ( int i = 0; i < n0; ++i )
 			{
-				c[k].featureId = b3Voxel_pairId( cells0[a], cells1[b], k );
-				b3Voxel_addReduced( &c[k], acc, &nacc, maxContacts );
+				b3VoxelOBB o0 = sb0 != NULL ? b3Voxel_cellSubOBBAxes( cells0[a], vs0, xf0, axes0, &sb0[i] ) : obb0;
+				for ( int j = 0; j < n1; ++j )
+				{
+					b3VoxelOBB o1 = sb1 != NULL ? b3Voxel_cellSubOBBAxes( cells1[b], vs1, xf1, axes1, &sb1[j] ) : obb1;
+
+					b3VoxelContact c[4];
+					int nc = b3VoxelCollideOBB( &o0, &o1, contactDistance, 4, c );
+
+					if ( nc > 0 && fabsf( c[0].initialPenetration ) <= 1e-8f &&
+						 !b3Voxel_facesExposed( v0, cells0[a], xf0, v1, cells1[b], xf1, c[0].normal ) )
+						continue;
+					for ( int k = 0; k < nc; ++k )
+					{
+						c[k].featureId = b3Voxel_pairId( cells0[a], cells1[b], k + ( ( i * 8 + j ) << 2 ) );
+						b3Voxel_addReduced( &c[k], acc, &nacc, maxContacts );
+					}
+				}
 			}
 		}
 	}

@@ -13,6 +13,7 @@
 typedef struct b3VoxelChunk
 {
 	uint8_t solid[B3_VOXEL_CHUNK_CELLS]; // 0 = air, 1 = solid; index (lx<<8)|(ly<<4)|lz
+	uint16_t geom[B3_VOXEL_CHUNK_CELLS];
 	b3Vec3i* occupied;					 // compact solid local cells (0..15 per axis)
 	int occupiedCount;
 	int occupiedCapacity;
@@ -41,6 +42,14 @@ struct b3VoxelData
 
 	b3VoxelChunkSlot* slots;  // hash: chunkKey -> chunks index
 	int slotCap;			  // power of two
+
+	b3VoxelSubBox* geomBoxes;
+	int geomBoxCount;
+	int geomBoxCapacity;
+	int* geomStarts;
+	int* geomCounts;
+	int geomEntryCount;
+	int geomEntryCapacity;
 };
 
 static inline int b3Voxel_iaxis( b3Vec3i c, int a )
@@ -143,6 +152,7 @@ static int b3Voxel_getOrCreateChunk( b3VoxelData* v, b3Vec3i chunkPos )
 	int idx = v->chunkCount++;
 	b3VoxelChunk* chunk = v->chunks + idx;
 	memset( chunk->solid, 0, sizeof( chunk->solid ) );
+	memset( chunk->geom, 0, sizeof( chunk->geom ) );
 	chunk->occupied = NULL;
 	chunk->occupiedCount = 0;
 	chunk->occupiedCapacity = 0;
@@ -153,7 +163,7 @@ static int b3Voxel_getOrCreateChunk( b3VoxelData* v, b3Vec3i chunkPos )
 	return idx;
 }
 
-b3VoxelData* b3CreateVoxelData( const b3Vec3i* cells, int count, float voxelSize )
+b3VoxelData* b3CreateVoxelDataEx( const b3Vec3i* cells, const uint16_t* geomIndices, int count, float voxelSize )
 {
 	if ( cells == NULL || count <= 0 || !( voxelSize > 0.0f ) )
 		return NULL;
@@ -180,6 +190,7 @@ b3VoxelData* b3CreateVoxelData( const b3Vec3i* cells, int count, float voxelSize
 		if ( chunk->solid[li] )
 			continue; // duplicate cell
 		chunk->solid[li] = 1;
+		chunk->geom[li] = geomIndices != NULL ? geomIndices[i] : 0;
 
 		if ( chunk->occupiedCount == chunk->occupiedCapacity )
 		{
@@ -228,6 +239,78 @@ b3VoxelData* b3CreateVoxelData( const b3Vec3i* cells, int count, float voxelSize
 	return v;
 }
 
+b3VoxelData* b3CreateVoxelData( const b3Vec3i* cells, int count, float voxelSize )
+{
+	return b3CreateVoxelDataEx( cells, NULL, count, voxelSize );
+}
+
+int b3VoxelData_AddGeometry( b3VoxelData* v, const b3VoxelSubBox* boxes, int count )
+{
+	if ( v == NULL || boxes == NULL || count <= 0 || v->geomEntryCount >= 65535 )
+		return 0;
+
+	if ( v->geomEntryCount == v->geomEntryCapacity )
+	{
+		int nc = v->geomEntryCapacity ? 2 * v->geomEntryCapacity : 8;
+		int* starts = (int*)b3Alloc( (size_t)nc * sizeof( int ) );
+		int* counts = (int*)b3Alloc( (size_t)nc * sizeof( int ) );
+		if ( v->geomStarts )
+		{
+			memcpy( starts, v->geomStarts, (size_t)v->geomEntryCount * sizeof( int ) );
+			memcpy( counts, v->geomCounts, (size_t)v->geomEntryCount * sizeof( int ) );
+			b3Free( v->geomStarts, (size_t)v->geomEntryCapacity * sizeof( int ) );
+			b3Free( v->geomCounts, (size_t)v->geomEntryCapacity * sizeof( int ) );
+		}
+		v->geomStarts = starts;
+		v->geomCounts = counts;
+		v->geomEntryCapacity = nc;
+	}
+	if ( v->geomBoxCount + count > v->geomBoxCapacity )
+	{
+		int nc = v->geomBoxCapacity ? v->geomBoxCapacity : 16;
+		while ( nc < v->geomBoxCount + count )
+			nc *= 2;
+		b3VoxelSubBox* grown = (b3VoxelSubBox*)b3Alloc( (size_t)nc * sizeof( b3VoxelSubBox ) );
+		if ( v->geomBoxes )
+		{
+			memcpy( grown, v->geomBoxes, (size_t)v->geomBoxCount * sizeof( b3VoxelSubBox ) );
+			b3Free( v->geomBoxes, (size_t)v->geomBoxCapacity * sizeof( b3VoxelSubBox ) );
+		}
+		v->geomBoxes = grown;
+		v->geomBoxCapacity = nc;
+	}
+
+	v->geomStarts[v->geomEntryCount] = v->geomBoxCount;
+	v->geomCounts[v->geomEntryCount] = count;
+	memcpy( v->geomBoxes + v->geomBoxCount, boxes, (size_t)count * sizeof( b3VoxelSubBox ) );
+	v->geomBoxCount += count;
+	v->geomEntryCount += 1;
+	return v->geomEntryCount; // 1-based palette index
+}
+
+const b3VoxelSubBox* b3Voxel_geomBoxesFor( const b3VoxelData* v, int geomIndex, int* countOut )
+{
+	*countOut = 0;
+	if ( v == NULL || geomIndex <= 0 || geomIndex > v->geomEntryCount )
+		return NULL;
+	*countOut = v->geomCounts[geomIndex - 1];
+	return v->geomBoxes + v->geomStarts[geomIndex - 1];
+}
+
+int b3Voxel_cellGeomIndex( const b3VoxelData* v, b3Vec3i cell )
+{
+	int ci = b3Voxel_findChunk( v, b3Voxel_packChunk( b3Voxel_chunkOf( cell ) ) );
+	if ( ci < 0 )
+		return 0;
+	int li = b3Voxel_localIndex( cell.x & B3_VOXEL_CHUNK_MASK, cell.y & B3_VOXEL_CHUNK_MASK, cell.z & B3_VOXEL_CHUNK_MASK );
+	return v->chunks[ci].solid[li] ? v->chunks[ci].geom[li] : 0;
+}
+
+uint16_t b3VoxelData_GetCellGeometry( const b3VoxelData* v, b3Vec3i cell )
+{
+	return (uint16_t)b3Voxel_cellGeomIndex( v, cell );
+}
+
 void b3DestroyVoxelData( b3VoxelData* v )
 {
 	if ( v == NULL )
@@ -242,6 +325,12 @@ void b3DestroyVoxelData( b3VoxelData* v )
 		b3Free( v->chunks, (size_t)v->chunkCapacity * sizeof( b3VoxelChunk ) );
 	if ( v->slots )
 		b3Free( v->slots, (size_t)v->slotCap * sizeof( b3VoxelChunkSlot ) );
+	if ( v->geomBoxes )
+		b3Free( v->geomBoxes, (size_t)v->geomBoxCapacity * sizeof( b3VoxelSubBox ) );
+	if ( v->geomStarts )
+		b3Free( v->geomStarts, (size_t)v->geomEntryCapacity * sizeof( int ) );
+	if ( v->geomCounts )
+		b3Free( v->geomCounts, (size_t)v->geomEntryCapacity * sizeof( int ) );
 	b3Free( v, sizeof( b3VoxelData ) );
 }
 
@@ -490,6 +579,7 @@ void b3Voxel_RemoveCells( b3VoxelData* v, const b3Vec3i* cells, int count )
 		if ( !chunk->solid[li] )
 			continue; // already air (or never solid)
 		chunk->solid[li] = 0;
+		chunk->geom[li] = 0;
 		for ( int k = 0; k < chunk->occupiedCount; ++k )
 		{
 			b3Vec3i lc = chunk->occupied[k];
@@ -504,6 +594,49 @@ void b3Voxel_RemoveCells( b3VoxelData* v, const b3Vec3i* cells, int count )
 
 	if ( removedAny )
 		b3Voxel_recomputeDerived( v );
+}
+
+void b3Voxel_AddCellsEx( b3VoxelData* v, const b3Vec3i* cells, const uint16_t* geomIndices, int count )
+{
+	if ( v == NULL || cells == NULL || count <= 0 )
+		return;
+
+	bool addedAny = false;
+	for ( int i = 0; i < count; ++i )
+	{
+		b3Vec3i cell = cells[i];
+		int ci = b3Voxel_getOrCreateChunk( v, b3Voxel_chunkOf( cell ) );
+		b3VoxelChunk* chunk = v->chunks + ci;
+		int lx = cell.x & B3_VOXEL_CHUNK_MASK, ly = cell.y & B3_VOXEL_CHUNK_MASK, lz = cell.z & B3_VOXEL_CHUNK_MASK;
+		int li = b3Voxel_localIndex( lx, ly, lz );
+		if ( chunk->solid[li] )
+			continue; // already solid
+		chunk->solid[li] = 1;
+		chunk->geom[li] = geomIndices != NULL ? geomIndices[i] : 0;
+
+		if ( chunk->occupiedCount == chunk->occupiedCapacity )
+		{
+			int nc = chunk->occupiedCapacity ? 2 * chunk->occupiedCapacity : 32;
+			b3Vec3i* grown = (b3Vec3i*)b3Alloc( (size_t)nc * sizeof( b3Vec3i ) );
+			if ( chunk->occupied )
+			{
+				memcpy( grown, chunk->occupied, (size_t)chunk->occupiedCount * sizeof( b3Vec3i ) );
+				b3Free( chunk->occupied, (size_t)chunk->occupiedCapacity * sizeof( b3Vec3i ) );
+			}
+			chunk->occupied = grown;
+			chunk->occupiedCapacity = nc;
+		}
+		chunk->occupied[chunk->occupiedCount++] = (b3Vec3i){ lx, ly, lz };
+		addedAny = true;
+	}
+
+	if ( addedAny )
+		b3Voxel_recomputeDerived( v );
+}
+
+void b3Voxel_AddCells( b3VoxelData* v, const b3Vec3i* cells, int count )
+{
+	b3Voxel_AddCellsEx( v, cells, NULL, count );
 }
 
 b3MassData b3Voxel_ComputeMass( const b3VoxelData* v, float density )
