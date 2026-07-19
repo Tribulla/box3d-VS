@@ -70,7 +70,7 @@ typedef struct b3FractureTuning
 							 ///< otherwise leave thousands of rubble bodies for the solver every step.
 	bool fractureEnabled;	 ///< master switch: analyse only vs. actually sever
 	bool contactStress;		 ///< fold Box3D contact forces into the analysis
-	bool stressEnabled;		 ///< run the lattice stress analysis (b3_fractureStress severs). When false only
+	bool stressEnabled;		 ///< allow spontaneous (load/sustained) stress fracturing. When false the engine is impact-only
 	bool parallelAnalysis;	 ///< run the per-body contact gathering and stress analysis on the world's
 							 ///< worker threads (needs b3WorldDef.workerCount > 1; all analyses then see
 							 ///< the same pre-fracture snapshot instead of earlier splits in the same step)
@@ -115,6 +115,8 @@ B3_API int b3World_MakeBodyFracture( b3WorldId worldId, b3BodyId bodyId, b3Fract
 /// enableContactEvents = true. @return an internal piece index (>= 0), or -1 on failure.
 B3_API int b3World_MakeVoxelBodyFracture( b3WorldId worldId, b3BodyId bodyId, b3FractureMaterial material,
 										  const b3FractureDef* def );
+
+B3_API bool b3World_RemoveVoxelBodyFracture( b3WorldId worldId, b3BodyId bodyId );
 
 /// Why a set of cells severed this step.
 typedef enum b3FractureReason

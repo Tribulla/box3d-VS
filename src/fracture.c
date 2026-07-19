@@ -1407,6 +1407,7 @@ typedef struct b3F_Decision
 	int cellB;	   // voxel kind: cell layer of the cut
 	int freeDir;   // voxel kind: which side is unsupported (+1 / -1 / 0)
 	bool fracture; // sever now
+	b3FractureReason reason; // why: an impact this frame vs sustained structural overload
 } b3F_Decision;
 
 static int b3F_stride( const b3FractureWorld* fw )
@@ -1870,12 +1871,12 @@ static void b3F_analyzePiece( b3FractureWorld* fw, int worker, int piece, bool d
 			}
 		}
 
-		if ( bestAxis >= 0 )
+		if ( bestAxis >= 0 && fw->tuning.stressEnabled )
 			P->overloadStreak += b3F_stride( fw ); // one analysis stands in for K frames of overload
 		else
 			P->overloadStreak = 0;
 		bool impactNow = P->peakApproach > fw->tuning.impactSpeed;
-		bool sustained = P->overloadStreak >= fw->tuning.fractureHoldFrames;
+		bool sustained = fw->tuning.stressEnabled && P->overloadStreak >= fw->tuning.fractureHoldFrames;
 
 		// eligibility was checked on entry, so an overload here may sever
 		if ( doFracture && bestAxis >= 0 && ( impactNow || sustained ) )
@@ -1884,6 +1885,7 @@ static void b3F_analyzePiece( b3FractureWorld* fw, int worker, int piece, bool d
 			dec->cellB = bestB;
 			dec->freeDir = bestFreeDir;
 			dec->fracture = true;
+			dec->reason = impactNow ? b3_fractureImpact : b3_fractureStress;
 		}
 	}
 }
@@ -1937,7 +1939,7 @@ static void b3F_severVoxelPiece( b3FractureWorld* fw, int piece, const b3F_Decis
 				b3F_sever( fw, v, f );
 		}
 	}
-	b3F_splitPiece( fw, piece, b3_fractureStress );
+	b3F_splitPiece( fw, piece, dec->reason );
 	fw->profSeverMs += b3GetMilliseconds( profTicks );
 }
 
@@ -2511,7 +2513,9 @@ void b3FractureWorld_Step( b3World* world, float dt )
 				continue; // inert: no interfaces left, nothing in the pipeline can affect it
 			if ( P->isStatic == 0 && b3Body_IsAwake( P->body ) == false )
 				continue;
-			bool analyse = fw->tuning.stressEnabled && ( stride == 1 || ( ( fw->frame + p ) % stride ) == 0 );
+			bool impactHit = P->peakApproach > fw->tuning.impactSpeed;
+			bool analyse = ( fw->tuning.stressEnabled || impactHit ) &&
+						   ( stride == 1 || ( ( fw->frame + p ) % stride ) == 0 || impactHit );
 			bool impacted = doFracture && ( P->kind == b3F_kindChunk ? b3F_impactChunkPiece( fw, p )
 																	 : b3F_impactFracture( fw, p ) );
 			if ( !impacted && analyse )
@@ -2546,7 +2550,9 @@ void b3FractureWorld_Step( b3World* world, float dt )
 				continue; // inert: no interfaces left, nothing in the pipeline can affect it
 			if ( P->isStatic == 0 && b3Body_IsAwake( P->body ) == false )
 				continue;
-			bool analyse = fw->tuning.stressEnabled && ( stride == 1 || ( ( fw->frame + p ) % stride ) == 0 );
+			bool impactHit = P->peakApproach > fw->tuning.impactSpeed;
+			bool analyse = ( fw->tuning.stressEnabled || impactHit ) &&
+						   ( stride == 1 || ( ( fw->frame + p ) % stride ) == 0 || impactHit );
 			b3F_Decision dec;
 			if ( P->kind == b3F_kindChunk )
 			{
@@ -3076,11 +3082,11 @@ static void b3F_analyzeChunkPiece( b3FractureWorld* fw, int worker, int piece, b
 			}
 		}
 
-		if ( bestAxis >= 0 )
+		if ( bestAxis >= 0 && fw->tuning.stressEnabled )
 			P->overloadStreak += b3F_stride( fw ); // one analysis stands in for K frames of overload
 		else
 			P->overloadStreak = 0;
-		bool sustained = P->overloadStreak >= fw->tuning.fractureHoldFrames;
+		bool sustained = fw->tuning.stressEnabled && P->overloadStreak >= fw->tuning.fractureHoldFrames;
 		bool impactNow = P->peakApproach > fw->tuning.impactSpeed;
 
 		if ( doFracture && bestAxis >= 0 && ( impactNow || sustained ) )
@@ -3088,6 +3094,7 @@ static void b3F_analyzeChunkPiece( b3FractureWorld* fw, int worker, int piece, b
 			dec->axis = bestAxis;
 			dec->cut = bestCut;
 			dec->fracture = true;
+			dec->reason = impactNow ? b3_fractureImpact : b3_fractureStress;
 		}
 	}
 }
@@ -3299,12 +3306,25 @@ static b3Vec3i b3F_hostCellBias( int slot )
 	return (b3Vec3i){ ( slot % L ) * S, ( ( slot / L ) % L ) * S, ( ( slot / ( L * L ) ) % L ) * S };
 }
 
+static void b3F_unbindHostPiece( b3FractureWorld* fw, int p )
+{
+	b3FracturePiece* P = fw->pieces.data + p;
+	for ( int i = 0; i < P->voxels.count; ++i )
+	{
+		b3FractureVoxel* vx = b3F_vox( fw, P->voxels.data[i] );
+		b3F_mapPut( &fw->cellToVox, b3F_packCell( vx->cell ), -1 );
+		vx->piece = -1;
+	}
+	P->active = 0;
+	b3Array_Clear( P->voxels );
+}
+
 static int b3F_addHostVoxelBody( b3FractureWorld* fw, b3BodyId bodyId, b3ShapeId shapeId, const b3Vec3i* cells, int count,
-								 b3FractureMaterial material, const b3FractureDef* def )
+								 b3FractureMaterial material, const b3FractureDef* def, const b3Vec3i* reuseBias )
 {
 	int matIdx = b3F_internMaterial( fw, material );
 	bool bodyStatic = b3Body_GetType( bodyId ) == b3_staticBody;
-	b3Vec3i bias = b3F_hostCellBias( fw->hostBindCount );
+	b3Vec3i bias = reuseBias ? *reuseBias : b3F_hostCellBias( fw->hostBindCount );
 
 	int* idx = (int*)b3Alloc( (size_t)count * sizeof( int ) );
 	int kept = 0;
@@ -3355,7 +3375,8 @@ static int b3F_addHostVoxelBody( b3FractureWorld* fw, b3BodyId bodyId, b3ShapeId
 	for ( int i = 0; i < kept; ++i )
 		b3F_vox( fw, idx[i] )->piece = p;
 
-	fw->hostBindCount++;
+	if ( reuseBias == NULL )
+		fw->hostBindCount++;
 	b3Free( idx, (size_t)count * sizeof( int ) );
 	return p;
 }
@@ -3396,9 +3417,18 @@ int b3World_MakeVoxelBodyFracture( b3WorldId worldId, b3BodyId bodyId, b3Fractur
 	if ( b3AbsFloat( fw->voxel - vs ) > 1e-6f * fw->voxel )
 		return -1;
 
+	b3Vec3i reuseBias;
+	const b3Vec3i* reuseBiasPtr = NULL;
 	for ( int p = 0; p < fw->pieces.count; ++p )
 		if ( fw->pieces.data[p].active && B3_ID_EQUALS( fw->pieces.data[p].body, bodyId ) )
-			return -1;
+		{
+			if ( !fw->pieces.data[p].hostOwned )
+				return -1; // engine-owned piece: not the host's to re-bind
+			reuseBias = fw->pieces.data[p].cellBias;
+			reuseBiasPtr = &reuseBias;
+			b3F_unbindHostPiece( fw, p );
+			break;
+		}
 
 	float shapeDensity = b3Shape_GetDensity( voxelShape );
 	if ( shapeDensity > 0.0f && material.density > 0.0f )
@@ -3410,9 +3440,25 @@ int b3World_MakeVoxelBodyFracture( b3WorldId worldId, b3BodyId bodyId, b3Fractur
 	b3Vec3i* cells = (b3Vec3i*)b3Alloc( (size_t)cellCount * sizeof( b3Vec3i ) );
 	int n = b3VoxelData_GetCells( vd, cells, cellCount );
 	b3FractureDef local = def ? *def : b3DefaultFractureDef();
-	int piece = b3F_addHostVoxelBody( fw, bodyId, voxelShape, cells, n, material, &local );
+	int piece = b3F_addHostVoxelBody( fw, bodyId, voxelShape, cells, n, material, &local, reuseBiasPtr );
 	b3Free( cells, (size_t)cellCount * sizeof( b3Vec3i ) );
 	return piece;
+}
+
+bool b3World_RemoveVoxelBodyFracture( b3WorldId worldId, b3BodyId bodyId )
+{
+	b3World* world = b3GetWorldFromId( worldId );
+	if ( world == NULL || world->fractureWorld == NULL )
+		return false;
+	b3FractureWorld* fw = (b3FractureWorld*)world->fractureWorld;
+	for ( int p = 0; p < fw->pieces.count; ++p )
+		if ( fw->pieces.data[p].active && fw->pieces.data[p].hostOwned &&
+			 B3_ID_EQUALS( fw->pieces.data[p].body, bodyId ) )
+		{
+			b3F_unbindHostPiece( fw, p );
+			return true;
+		}
+	return false;
 }
 
 b3FractureEvents b3World_GetFractureEvents( b3WorldId worldId )
