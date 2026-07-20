@@ -115,6 +115,7 @@ samples). The base engine builds on Windows, Linux, and macOS.
 - Windows: `cmake --preset windows` then `cmake --build --preset windows-release`
 - Linux: `cmake --preset linux-release` then `cmake --build --preset linux-release`
 - macOS: `cmake --preset macos` then `cmake --build --preset macos-release`
+- Windows MinGW: `cmake --preset mingw-release` then `cmake --build --preset mingw-release`
 
 **Visual Studio 2026** (the primary dev setup):
 

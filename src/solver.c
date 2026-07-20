@@ -127,7 +127,7 @@ static void b3IntegrateVelocitiesTask( b3SolverBlock block, b3StepContext* conte
 			float i12 = inertiaLocal.cz.y;
 			float i22 = inertiaLocal.cz.z;
 
-			for ( int gyroIteration = 0; gyroIteration < 1; ++gyroIteration )
+			for ( int gyroIteration = 0; gyroIteration < B3_GYROSCOPIC_ITERATIONS; ++gyroIteration )
 			{
 				float w1 = omega2.x;
 				float w2 = omega2.y;
@@ -423,6 +423,11 @@ static bool b3ContinuousQueryCallback( int proxyId, uint64_t userData, void* con
 	bool fastIsVoxel = fastShape->type == b3_voxelShape;
 	if ( shape->type == b3_voxelShape || fastIsVoxel )
 	{
+		// The GJK time of impact cannot represent a voxel grid, so sweep a proxy of
+		// the fast shape with a translation-only shape cast instead. Rotation over the
+		// sweep is ignored: the angular clamp bounds the error, except for bodies with
+		// b3_allowFastRotation, which trade CCD accuracy for spin. Hulls beyond
+		// B3_MAX_SHAPE_CAST_POINTS vertices are swept as a truncated point cloud.
 		output = ( b3TOIOutput ){ 0 };
 		output.fraction = continuousContext->fraction; // default: no earlier hit
 
@@ -430,6 +435,9 @@ static bool b3ContinuousQueryCallback( int proxyId, uint64_t userData, void* con
 		b3ShapeCastInput castInput = { 0 };
 		if ( fastIsVoxel )
 		{
+			// A voxel grid has no convex proxy: sweep the largest sphere that fits
+			// inside its bounds at the centroid. Tunneling of the parts outside the
+			// sphere is then bounded and the discrete solver resolves them.
 			b3AABB fastBounds = b3VoxelData_GetBounds( fastShape->voxel );
 			b3Vec3 c = fastShape->localCentroid;
 			b3Vec3 d1 = b3Sub( c, fastBounds.lowerBound );
@@ -452,6 +460,7 @@ static bool b3ContinuousQueryCallback( int proxyId, uint64_t userData, void* con
 			castInput.proxy = ( b3ShapeProxy ){ points, count, proxy.radius };
 		}
 
+		// Sweep relative to the target so moving bullet targets are respected.
 		b3Vec3 translation = b3Sub( continuousContext->centroid2, continuousContext->centroid1 );
 		translation = b3Sub( translation, b3Sub( sweepA.c2, sweepA.c1 ) );
 		castInput.translation = translation;
@@ -577,6 +586,8 @@ static void b3SolveContinuous( b3World* world, int bodySimIndex, b3TaskContext* 
 		// Store this to avoid double computation in the case there is no impact event
 		fastShape->aabb = box2;
 
+		// Mesh and height-field shapes cannot be fast movers; a fast voxel shape is
+		// swept as its inscribed sphere in b3ContinuousQueryCallback.
 		if ( fastShape->type == b3_meshShape || fastShape->type == b3_heightShape )
 		{
 			continue;

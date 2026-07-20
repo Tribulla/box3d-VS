@@ -654,6 +654,11 @@ static void b3CollideTask( int startIndex, int endIndex, int workerIndex, void* 
 		contact->bodySimIndexB = isStaticB ? B3_NULL_INDEX : bodyB->localIndex;
 		float recycleTolerance = wasTouching ? recycleDistance : recycleDistanceNonTouching;
 
+		// Expected relative motion over the next step. Voxel manifolds grow their
+		// speculative band by this so contacts exist before an impact: they are built
+		// once per full step, and the fixed band only covers 2 cm of approach. Capped
+		// at the continuous-collision trigger (beyond it CCD owns the problem) and at
+		// half a meter to bound the cell queries.
 		float relMotion = 0.0f;
 		if ( shapeA->type == b3_voxelShape || shapeB->type == b3_voxelShape )
 		{
@@ -663,12 +668,18 @@ static void b3CollideTask( int startIndex, int endIndex, int workerIndex, void* 
 																				 : b3Vec3_zero;
 			float cap = 0.5f * ( ( isStaticA ? 0.0f : bodySimA->minExtent ) + ( isStaticB ? 0.0f : bodySimB->minExtent ) );
 			cap = b3MinFloat( cap, 0.5f * b3GetLengthUnitsPerMeter() );
+			// Keep the full band even above the continuous-collision trigger: the
+			// speculative points brake a fast body before it reaches the surface,
+			// which is cheaper than the deep-overlap manifolds it produces otherwise
+			// (measured: dropping the band for CCD-covered pairs doubled collide).
 			relMotion = b3MinFloat( b3Length( b3Sub( vA, vB ) ) * collideTimeStep, cap );
 		}
 
 		// Contact recycling optimization. Please cite this library if you use this optimization.
 		// This is inspired by persistent contact manifolds used in some physics engines, such as PhysX.
 		// However, this allows larger relative motion and has fewer tuning parameters (just one).
+		// A fast-approaching voxel pair skips recycling: the cached manifold was built
+		// with a narrower speculative band than the approach now needs.
 		if ( ( isFast == false || isMeshContact == false ) && recycleDistance > 0.0f && relMotion <= recycleTolerance &&
 			 ( contact->flags & b3_relativeTransformValid ) && ( contact->flags & b3_contactRecycleFlag ) )
 		{
@@ -1559,7 +1570,7 @@ void b3World_Draw( b3WorldId worldId, b3DebugDraw* draw, uint64_t maskBits )
 							b3Vec3 normal = manifold->normal;
 
 							// Average the anchors not the world points so the friction center stays exact far from the origin
-							b3Pos contactCenter = draw->drawAnchorA == 1 ? bodySimA->center : bodySimB->center;
+							b3Pos contactCenter = draw->drawAnchorA ? bodySimA->center : bodySimB->center;
 							b3Vec3 frictionAnchor = b3Vec3_zero;
 							float totalWeight = 0.0f;
 							float invTau = 1.0f / B3_SPECULATIVE_DISTANCE;
@@ -1571,7 +1582,7 @@ void b3World_Draw( b3WorldId worldId, b3DebugDraw* draw, uint64_t maskBits )
 
 								char buffer[32];
 
-								b3Vec3 anchor = draw->drawAnchorA == 1 ? mp->anchorA : mp->anchorB;
+								b3Vec3 anchor = draw->drawAnchorA ? mp->anchorA : mp->anchorB;
 								b3Pos p = b3OffsetPos( contactCenter, anchor );
 
 								// See similar friction anchor weights in b3PrepareContacts_Mesh.
