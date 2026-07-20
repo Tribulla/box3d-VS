@@ -1195,9 +1195,6 @@ static void b3F_gatherContactForces( b3World* world, b3FractureWorld* fw, float 
 {
 	for ( int p = 0; p < fw->pieces.count; ++p )
 		fw->pieces.data[p].peakApproach = 0.0f;
-			// Latch support for a few frames: aggregated voxel manifolds drop and
-			// re-form contact points frame-to-frame, so a hard reset would make a
-			// resting face's support set flicker and spuriously fracture the body.
 
 	bool contactStress = fw->tuning.contactStress;
 	float a = fw->tuning.contactSmoothing;
@@ -1280,26 +1277,30 @@ static bool b3F_impactFracture( b3FractureWorld* fw, int piece )
 	}
 	uint64_t profTicks = b3GetTicks(); // the impact response (BFS + sever + split) is sever time
 
-	int radius = fw->tuning.impactRadius + (int)b3F_min( 2.0f, overload - 1.0f );
+	float bonus = overload > 1.0f ? logf( overload ) * ( 1.0f / 1.0986123f ) : 0.0f;
+	int radius = fw->tuning.impactRadius + (int)b3F_min( 8.0f, bonus );
 	int* frontier = (int*)b3Alloc( (size_t)fw->voxels.count * sizeof( int ) );
 	int* nextf = (int*)b3Alloc( (size_t)fw->voxels.count * sizeof( int ) );
 	int fn = 0;
 	for ( int i = 0; i < count; ++i )
 		if ( isSite[voxbuf[i]] )
 			frontier[fn++] = voxbuf[i];
-	for ( int ring = 0; ring < radius && fn > 0; ++ring )
+	int rim = count / 10;
+	int siteLimit = count - ( rim > 1 ? rim : 1 );
+	for ( int ring = 0; ring < radius && fn > 0 && nSites < siteLimit; ++ring )
 	{
 		int nn = 0;
-		for ( int i = 0; i < fn; ++i )
+		for ( int i = 0; i < fn && nSites < siteLimit; ++i )
 		{
 			int v = frontier[i];
-			for ( int f = 0; f < 6; ++f )
+			for ( int f = 0; f < 6 && nSites < siteLimit; ++f )
 			{
 				int nv = b3F_neighbor( fw, v, f, piece );
 				if ( nv >= 0 && !isSite[nv] )
 				{
 					isSite[nv] = 1;
 					nextf[nn++] = nv;
+					nSites += 1;
 				}
 			}
 		}
@@ -1309,6 +1310,7 @@ static bool b3F_impactFracture( b3FractureWorld* fw, int piece )
 		fn = nn;
 	}
 
+	int severed = 0;
 	for ( int i = 0; i < count; ++i )
 	{
 		int v = voxbuf[i];
@@ -1320,7 +1322,10 @@ static bool b3F_impactFracture( b3FractureWorld* fw, int piece )
 			b3Vec3i nc = { vx->cell.x + FACE[f][0], vx->cell.y + FACE[f][1], vx->cell.z + FACE[f][2] };
 			int nv = b3F_mapGet( &fw->cellToVox, b3F_packCell( nc ) );
 			if ( nv >= 0 && b3F_vox( fw, nv )->piece == piece && !isSite[nv] )
+			{
 				b3F_sever( fw, v, f );
+				severed += 1;
+			}
 		}
 	}
 
@@ -1328,6 +1333,12 @@ static bool b3F_impactFracture( b3FractureWorld* fw, int piece )
 	b3Free( frontier, (size_t)fw->voxels.count * sizeof( int ) );
 	b3Free( isSite, (size_t)fw->voxels.count );
 	b3Free( voxbuf, (size_t)count * sizeof( int ) );
+
+	if ( severed == 0 )
+	{
+		fw->profSeverMs += b3GetMilliseconds( profTicks );
+		return false;
+	}
 
 	b3F_splitPiece( fw, piece, b3_fractureImpact );
 	fw->profSeverMs += b3GetMilliseconds( profTicks );

@@ -19,7 +19,7 @@
 #include "sensor.h"
 #include "shape.h"
 #include "solver_set.h"
-#include "voxel_shape.h" // b3RayCastVoxel
+#include "voxel_shape.h" // b3VoxelData accessors for the voxel CCD proxy
 
 #include <float.h>
 #include <limits.h>
@@ -420,30 +420,50 @@ static bool b3ContinuousQueryCallback( int proxyId, uint64_t userData, void* con
 
 	// Time of impact versus shape. Supports all shape types
 	b3TOIOutput output;
-	if ( shape->type == b3_voxelShape )
+	bool fastIsVoxel = fastShape->type == b3_voxelShape;
+	if ( shape->type == b3_voxelShape || fastIsVoxel )
 	{
 		output = ( b3TOIOutput ){ 0 };
 		output.fraction = continuousContext->fraction; // default: no earlier hit
 
-		b3BodySim* voxelSim = b3GetBodySim( world, body );
-		b3Transform xfVoxel = { b3SubPos( voxelSim->transform.p, continuousContext->base ), voxelSim->transform.q };
-		b3Vec3 o = b3InvTransformPoint( xfVoxel, continuousContext->centroid1 );
-		b3Vec3 e = b3InvTransformPoint( xfVoxel, continuousContext->centroid2 );
-		b3Vec3 d = b3Sub( e, o );
-		float len = b3Length( d );
-		if ( len > FLT_EPSILON )
+		b3Vec3 points[B3_MAX_SHAPE_CAST_POINTS];
+		b3ShapeCastInput castInput = { 0 };
+		if ( fastIsVoxel )
 		{
-			b3RayCastInput input = { o, d, 1.0f };
-			b3CastOutput cast = b3RayCastVoxel( shape->voxel, &input );
-			if ( cast.hit )
+			b3AABB fastBounds = b3VoxelData_GetBounds( fastShape->voxel );
+			b3Vec3 c = fastShape->localCentroid;
+			b3Vec3 d1 = b3Sub( c, fastBounds.lowerBound );
+			b3Vec3 d2 = b3Sub( fastBounds.upperBound, c );
+			float face = b3MinFloat( b3MinFloat( b3MinFloat( d1.x, d2.x ), b3MinFloat( d1.y, d2.y ) ),
+									 b3MinFloat( d1.z, d2.z ) );
+			float halfCell = 0.5f * b3VoxelData_GetVoxelSize( fastShape->voxel );
+			points[0] = continuousContext->centroid1;
+			castInput.proxy = ( b3ShapeProxy ){ points, 1, b3MaxFloat( face, halfCell ) };
+		}
+		else
+		{
+			b3Transform xfFast1 = b3GetSweepTransform( &continuousContext->sweep, 0.0f );
+			b3ShapeProxy proxy = b3MakeShapeProxy( fastShape );
+			int count = b3MinInt( proxy.count, B3_MAX_SHAPE_CAST_POINTS );
+			for ( int i = 0; i < count; ++i )
 			{
-				float frac = cast.fraction - fastBodySim->minExtent / len;
-				if ( frac < 0.0f )
-					frac = 0.0f;
-				output.fraction = frac;
-				output.point = b3Lerp( continuousContext->centroid1, continuousContext->centroid2, cast.fraction );
-				output.normal = b3RotateVector( xfVoxel.q, cast.normal );
+				points[i] = b3TransformPoint( xfFast1, proxy.points[i] );
 			}
+			castInput.proxy = ( b3ShapeProxy ){ points, count, proxy.radius };
+		}
+
+		b3Vec3 translation = b3Sub( continuousContext->centroid2, continuousContext->centroid1 );
+		translation = b3Sub( translation, b3Sub( sweepA.c2, sweepA.c1 ) );
+		castInput.translation = translation;
+		castInput.maxFraction = continuousContext->fraction;
+
+		b3Transform xfTarget = b3GetSweepTransform( &sweepA, 1.0f );
+		b3CastOutput cast = b3ShapeCastShape( shape, xfTarget, &castInput );
+		if ( cast.hit && cast.fraction < continuousContext->fraction )
+		{
+			output.fraction = cast.fraction;
+			output.point = cast.point;
+			output.normal = cast.normal;
 		}
 	}
 	else
@@ -557,7 +577,7 @@ static void b3SolveContinuous( b3World* world, int bodySimIndex, b3TaskContext* 
 		// Store this to avoid double computation in the case there is no impact event
 		fastShape->aabb = box2;
 
-		if ( fastShape->type == b3_meshShape || fastShape->type == b3_heightShape || fastShape->type == b3_voxelShape )
+		if ( fastShape->type == b3_meshShape || fastShape->type == b3_heightShape )
 		{
 			continue;
 		}

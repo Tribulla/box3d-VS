@@ -900,9 +900,12 @@ b3ShapeExtent b3ComputeShapeExtent( const b3Shape* shape, b3Vec3 localCenter )
 		case b3_voxelShape:
 		{
 			b3AABB aabb = b3VoxelData_GetBounds( shape->voxel );
-			float r1 = b3Length( b3Sub( aabb.lowerBound, localCenter ) );
-			float r2 = b3Length( b3Sub( aabb.upperBound, localCenter ) );
-			extent.minExtent = b3MinFloat( r1, r2 );
+			b3Vec3 d1 = b3Sub( localCenter, aabb.lowerBound );
+			b3Vec3 d2 = b3Sub( aabb.upperBound, localCenter );
+			float face = b3MinFloat( b3MinFloat( b3MinFloat( d1.x, d2.x ), b3MinFloat( d1.y, d2.y ) ),
+									 b3MinFloat( d1.z, d2.z ) );
+			float halfCell = 0.5f * b3VoxelData_GetVoxelSize( shape->voxel );
+			extent.minExtent = b3MaxFloat( face, halfCell );
 			b3Vec3 p = b3FarthestPointOnAABB( aabb, localCenter );
 			extent.maxExtent = b3Abs( p );
 		}
@@ -994,6 +997,11 @@ b3CastOutput b3ShapeCastShape( const b3Shape* shape, b3Transform transform, cons
 		case b3_sphereShape:
 			output = b3ShapeCastSphere( &shape->sphere, &localInput );
 			break;
+
+		case b3_voxelShape:
+			output = b3ShapeCastVoxel( shape->voxel, &localInput );
+			break;
+
 		default:
 			return output;
 	}

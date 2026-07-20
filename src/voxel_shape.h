@@ -31,4 +31,6 @@ int b3Voxel_cellGeomIndex( const b3VoxelData* v, b3Vec3i cell );
 
 b3CastOutput b3RayCastVoxel( const b3VoxelData* v, const b3RayCastInput* input );
 
+b3CastOutput b3ShapeCastVoxel( const b3VoxelData* v, const b3ShapeCastInput* input );
+
 bool b3OverlapVoxel( const b3VoxelData* v, b3Transform xf, const b3ShapeProxy* proxy );

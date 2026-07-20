@@ -164,6 +164,7 @@ set(SAMPLE_FILES
     sample_impact.cpp
     sample_voxel_benchmark.cpp
     sample_voxel_collision.cpp
+    sample_voxel_teardown.cpp
 )
 
 add_executable(samples ${SAMPLE_FILES})

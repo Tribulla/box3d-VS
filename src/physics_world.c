@@ -569,6 +569,8 @@ static void b3CollideTask( int startIndex, int endIndex, int workerIndex, void* 
 	b3Body* bodies = world->bodies.data;
 	b3BodySim* awakeSims = world->solverSets.data[b3_awakeSet].bodySims.data;
 	b3BodySim* staticSims = world->solverSets.data[b3_staticSet].bodySims.data;
+	b3BodyState* awakeStates = world->solverSets.data[b3_awakeSet].bodyStates.data;
+	float collideTimeStep = stepContext->dt;
 
 	B3_ASSERT( startIndex < endIndex );
 
@@ -652,10 +654,22 @@ static void b3CollideTask( int startIndex, int endIndex, int workerIndex, void* 
 		contact->bodySimIndexB = isStaticB ? B3_NULL_INDEX : bodyB->localIndex;
 		float recycleTolerance = wasTouching ? recycleDistance : recycleDistanceNonTouching;
 
+		float relMotion = 0.0f;
+		if ( shapeA->type == b3_voxelShape || shapeB->type == b3_voxelShape )
+		{
+			b3Vec3 vA = ( isStaticA == false && bodyA->setIndex == b3_awakeSet ) ? awakeStates[bodyA->localIndex].linearVelocity
+																				 : b3Vec3_zero;
+			b3Vec3 vB = ( isStaticB == false && bodyB->setIndex == b3_awakeSet ) ? awakeStates[bodyB->localIndex].linearVelocity
+																				 : b3Vec3_zero;
+			float cap = 0.5f * ( ( isStaticA ? 0.0f : bodySimA->minExtent ) + ( isStaticB ? 0.0f : bodySimB->minExtent ) );
+			cap = b3MinFloat( cap, 0.5f * b3GetLengthUnitsPerMeter() );
+			relMotion = b3MinFloat( b3Length( b3Sub( vA, vB ) ) * collideTimeStep, cap );
+		}
+
 		// Contact recycling optimization. Please cite this library if you use this optimization.
 		// This is inspired by persistent contact manifolds used in some physics engines, such as PhysX.
 		// However, this allows larger relative motion and has fewer tuning parameters (just one).
-		if ( ( isFast == false || isMeshContact == false ) && recycleDistance > 0.0f &&
+		if ( ( isFast == false || isMeshContact == false ) && recycleDistance > 0.0f && relMotion <= recycleTolerance &&
 			 ( contact->flags & b3_relativeTransformValid ) && ( contact->flags & b3_contactRecycleFlag ) )
 		{
 			float angleA = b3DotQuat( transformA.q, contact->cachedRotationA );
@@ -741,7 +755,7 @@ static void b3CollideTask( int startIndex, int endIndex, int workerIndex, void* 
 
 		// This updates solid contacts
 		bool touching = b3UpdateContact( world, workerIndex, contact, shapeA, bodySimA->localCenter, transformA, shapeB,
-										 bodySimB->localCenter, transformB, isFast, taskContext->arena );
+										 bodySimB->localCenter, transformB, isFast, relMotion, taskContext->arena );
 
 		int bucketIndex = b3MinInt( contact->manifoldCount, B3_CONTACT_MANIFOLD_COUNT_BUCKETS - 1 );
 		if ( bucketIndex > 0 )

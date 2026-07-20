@@ -348,9 +348,10 @@ public:
 		{
 			b3Profile p = b3World_GetProfile( m_worldId );
 			b3Counters c = b3World_GetCounters( m_worldId );
-			printf( "[vox-frac] step=%d bodies=%d contacts=%d | step=%.3f collide=%.3f solve=%.3f constr=%.3f "
-					"frac=%.3f (gather=%.3f analyze=%.3f sever=%.3f)\n",
-					m_stepCount, c.bodyCount, c.contactCount, p.step, p.collide, p.solve, p.constraints, p.fracture,
+			printf( "[vox-frac] step=%d bodies=%d contacts=%d pieces=%d voxels=%d | step=%.3f collide=%.3f solve=%.3f "
+					"constr=%.3f frac=%.3f (gather=%.3f analyze=%.3f sever=%.3f)\n",
+					m_stepCount, c.bodyCount, c.contactCount, b3World_GetFractureBodyCount( m_worldId ),
+					b3World_GetFractureVoxelCount( m_worldId ), p.step, p.collide, p.solve, p.constraints, p.fracture,
 					p.fractureGather, p.fractureAnalyze, p.fractureSever );
 			fflush( stdout );
 		}

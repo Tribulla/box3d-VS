@@ -6,6 +6,7 @@ set(BOX3D_TEST_FILES
     test_bitset.c
 	test_body.c
 	test_body_query.c
+	test_ccd_voxel.c
 	test_collision.c
 	test_compound.c
 	test_container.c

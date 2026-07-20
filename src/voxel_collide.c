@@ -492,6 +492,51 @@ static bool b3Voxel_facesExposed( const b3VoxelData* v0, b3Vec3i cell0, b3Transf
 	return true;
 }
 
+static float b3Voxel_pushAlong( const b3VoxelOBB* a, const b3VoxelOBB* b, b3Vec3 axis )
+{
+	float ra = b3AbsFloat( b3Dot( axis, a->axes[0] ) ) * a->half.x + b3AbsFloat( b3Dot( axis, a->axes[1] ) ) * a->half.y +
+			   b3AbsFloat( b3Dot( axis, a->axes[2] ) ) * a->half.z;
+	float rb = b3AbsFloat( b3Dot( axis, b->axes[0] ) ) * b->half.x + b3AbsFloat( b3Dot( axis, b->axes[1] ) ) * b->half.y +
+			   b3AbsFloat( b3Dot( axis, b->axes[2] ) ) * b->half.z;
+	return ra + rb - b3Dot( axis, b3Sub( a->center, b->center ) );
+}
+
+static bool b3Voxel_escapeContact( const b3VoxelData* v0, b3Vec3i cell0, b3Transform xf0, const b3VoxelOBB* o0,
+									const b3VoxelData* v1, b3Vec3i cell1, b3Transform xf1, const b3VoxelOBB* o1,
+									b3VoxelContact* out )
+{
+	float bestPush = FLT_MAX;
+	b3Vec3 bestDir = b3Vec3_zero;
+	for ( int axis = 0; axis < 6; ++axis )
+	{
+		b3Vec3 dir = axis < 3 ? o0->axes[axis] : o1->axes[axis - 3];
+		for ( int sign = 0; sign < 2; ++sign )
+		{
+			b3Vec3 e = sign ? b3Neg( dir ) : dir;
+			if ( !b3Voxel_facesExposed( v0, cell0, xf0, v1, cell1, xf1, e ) )
+				continue;
+			float push = b3Voxel_pushAlong( o0, o1, e );
+			if ( push < bestPush )
+			{
+				bestPush = push;
+				bestDir = e;
+			}
+		}
+	}
+	if ( bestPush == FLT_MAX || bestPush <= 0.0f )
+		return false;
+	float bestOverlap = bestPush;
+
+	b3Vec3 mid = b3MulSV( 0.5f, b3Add( o0->center, o1->center ) );
+	out->normal = bestDir;
+	out->initialPenetration = bestOverlap;
+	out->penetrationDepth = bestOverlap;
+	out->body0Point = b3MulAdd( mid, -0.5f * bestOverlap, bestDir );
+	out->body1Point = b3MulAdd( mid, 0.5f * bestOverlap, bestDir );
+	out->featureId = 0;
+	return true;
+}
+
 static float b3Voxel_spreadScore( const b3VoxelContact* c, const b3VoxelContact* set, int n, int skip )
 {
 	float minD = FLT_MAX;
@@ -612,14 +657,14 @@ int b3VoxelCollide( const b3VoxelData* v0, b3Transform xf0, const b3VoxelData* v
 
 	b3VoxelContact acc[B3_VOXEL_MAX_CONTACTS];
 	int nacc = 0;
-	b3Vec3i cells1[256];
+	b3Vec3i cells1[1024];
 
 	for ( int a = 0; a < nc0; ++a )
 	{
 		b3VoxelOBB obb0 = b3Voxel_cellOBBAxes( cells0[a], vs0, xf0, axes0, half0 );
 		b3AABB ewb0 = b3Voxel_expandB( b3VoxelOBB_Bounds( &obb0 ), contactDistance );
 		b3AABB q1 = b3Voxel_mapBounds( ewb0, xf1, true );
-		int nc1 = b3Voxel_QueryCells( v1, q1, cells1, 256 );
+		int nc1 = b3Voxel_QueryCells( v1, q1, cells1, 1024 );
 
 		int ng0 = 0;
 		const b3VoxelSubBox* sb0 = b3Voxel_geomBoxesFor( v0, b3Voxel_cellGeomIndex( v0, cells0[a] ), &ng0 );
@@ -651,12 +696,33 @@ int b3VoxelCollide( const b3VoxelData* v0, b3Transform xf0, const b3VoxelData* v
 					b3VoxelContact c[4];
 					int nc = b3VoxelCollideOBB( &o0, &o1, contactDistance, 4, c );
 
-					if ( nc > 0 && fabsf( c[0].initialPenetration ) <= 1e-8f &&
-						 !b3Voxel_facesExposed( v0, cells0[a], xf0, v1, cells1[b], xf1, c[0].normal ) )
-						continue;
+					if ( nc > 0 )
+					{
+						float pen = c[0].initialPenetration;
+						for ( int k = 1; k < nc; ++k )
+							pen = b3MaxFloat( pen, c[k].initialPenetration );
+						bool exposed = b3Voxel_facesExposed( v0, cells0[a], xf0, v1, cells1[b], xf1, c[0].normal );
+						if ( exposed == false )
+						{
+							if ( fabsf( pen ) <= 1e-8f )
+								continue;
+							if ( pen > 0.25f * b3MinFloat( vs0, vs1 ) )
+							{
+								b3VoxelContact sub;
+								if ( b3Voxel_escapeContact( v0, cells0[a], xf0, &o0, v1, cells1[b], xf1, &o1, &sub ) )
+								{
+									sub.featureId = b3Voxel_pairId( cells0[a], cells1[b], 0xFF + ( ( i * 8 + j ) << 2 ) );
+									sub.penetrationDepth = contactDistance + sub.initialPenetration;
+									b3Voxel_addReduced( &sub, acc, &nacc, maxContacts );
+								}
+								continue;
+							}
+						}
+					}
 					for ( int k = 0; k < nc; ++k )
 					{
 						c[k].featureId = b3Voxel_pairId( cells0[a], cells1[b], k + ( ( i * 8 + j ) << 2 ) );
+						c[k].penetrationDepth = b3MaxFloat( contactDistance + c[k].initialPenetration, 0.0f );
 						b3Voxel_addReduced( &c[k], acc, &nacc, maxContacts );
 					}
 				}
@@ -870,4 +936,106 @@ bool b3OverlapVoxel( const b3VoxelData* v, b3Transform xf, const b3ShapeProxy* p
 	}
 
 	return false;
+}
+
+// Shape cast: sweep a convex proxy through the grid in shape-local space and return
+// the first time of impact (mirrors b3ShapeCastMesh: a GJK pair cast against each
+// candidate cell box). The translation is walked in slices so cell queries stay
+// bounded on long sweeps and the walk can stop early at the first hit.
+b3CastOutput b3ShapeCastVoxel( const b3VoxelData* v, const b3ShapeCastInput* input )
+{
+	b3CastOutput best = { 0 };
+	best.fraction = input->maxFraction;
+
+	if ( b3Voxel_GetCellCount( v ) == 0 || input->proxy.count == 0 )
+	{
+		return best;
+	}
+
+	float s = b3Voxel_GetVoxelSize( v );
+	float half = 0.5f * s;
+
+	b3AABB proxyBounds = b3ComputeProxyAABB( &input->proxy );
+	b3Vec3 extent = b3Sub( proxyBounds.upperBound, proxyBounds.lowerBound );
+	float sweepLen = input->maxFraction * b3Length( input->translation );
+
+	// Solver sweeps are bounded by the maximum body speed, so they use a handful of
+	// slices; the cap is a runaway guard for very long user casts, where oversized
+	// slices cost query time but the uncapped retry below keeps them correct.
+	float sliceLen = b3MaxFloat( 4.0f * s, b3MaxFloat( extent.x, b3MaxFloat( extent.y, extent.z ) ) );
+	int sliceCount = sweepLen > sliceLen ? (int)ceilf( sweepLen / sliceLen ) : 1;
+	if ( sliceCount > 1024 )
+	{
+		sliceCount = 1024;
+	}
+
+	for ( int slice = 0; slice < sliceCount; ++slice )
+	{
+		float f0 = input->maxFraction * (float)slice / (float)sliceCount;
+		float f1 = input->maxFraction * (float)( slice + 1 ) / (float)sliceCount;
+
+		// A later slice cannot beat an accepted hit: cells on the slice boundary are
+		// seen by both slices through the half-cell expansion below.
+		if ( best.hit && best.fraction <= f0 )
+		{
+			break;
+		}
+
+		b3Vec3 o0 = b3MulSV( f0, input->translation );
+		b3Vec3 o1 = b3MulSV( f1, input->translation );
+		b3Vec3 lo = b3Min( b3Add( proxyBounds.lowerBound, o0 ), b3Add( proxyBounds.lowerBound, o1 ) );
+		b3Vec3 hi = b3Max( b3Add( proxyBounds.upperBound, o0 ), b3Add( proxyBounds.upperBound, o1 ) );
+		b3AABB query = { { lo.x - half, lo.y - half, lo.z - half }, { hi.x + half, hi.y + half, hi.z + half } };
+
+		b3Vec3i stackCells[512];
+		b3Vec3i* cells = stackCells;
+		int cap = 512;
+		int n = b3Voxel_QueryCells( v, query, cells, cap );
+		b3Vec3i* heapCells = NULL;
+		if ( n == cap )
+		{
+			// The stack buffer may have truncated; retry with room for every cell.
+			// No clamp: cells are enumerated in chunk order, not sweep order, so a
+			// dropped candidate could be exactly the first cell the proxy hits.
+			cap = b3Voxel_GetCellCount( v );
+			heapCells = (b3Vec3i*)b3Alloc( (size_t)cap * sizeof( b3Vec3i ) );
+			cells = heapCells;
+			n = b3Voxel_QueryCells( v, query, cells, cap );
+		}
+
+		for ( int i = 0; i < n; ++i )
+		{
+			b3Vec3 c = { cells[i].x * s, cells[i].y * s, cells[i].z * s };
+			b3Vec3 corners[8];
+			for ( int k = 0; k < 8; ++k )
+			{
+				corners[k] = (b3Vec3){
+					c.x + ( ( k & 1 ) ? half : -half ),
+					c.y + ( ( k & 2 ) ? half : -half ),
+					c.z + ( ( k & 4 ) ? half : -half ),
+				};
+			}
+
+			b3ShapeCastPairInput pairInput;
+			pairInput.proxyA = (b3ShapeProxy){ corners, 8, 0.0f };
+			pairInput.proxyB = input->proxy;
+			pairInput.transform = b3Transform_identity;
+			pairInput.translationB = input->translation;
+			pairInput.maxFraction = best.fraction;
+			pairInput.canEncroach = input->canEncroach;
+
+			b3CastOutput pairOutput = b3ShapeCast( &pairInput );
+			if ( pairOutput.hit )
+			{
+				best = pairOutput;
+			}
+		}
+
+		if ( heapCells != NULL )
+		{
+			b3Free( heapCells, (size_t)cap * sizeof( b3Vec3i ) );
+		}
+	}
+
+	return best;
 }

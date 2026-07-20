@@ -332,6 +332,78 @@ static int b3VoxelCollideConvex( const b3VoxelData* v, const b3Shape* convex, b3
 				return nacc;
 		}
 
+		if ( m.pointCount > 0 )
+		{
+			b3Vec3 n = m.normal; // points from the cell toward the convex
+			float ax = b3AbsFloat( n.x ), ay = b3AbsFloat( n.y ), az = b3AbsFloat( n.z );
+			b3Vec3i off = { n.x > 0.0f ? 1 : -1, 0, 0 };
+			float dom = ax;
+			if ( ay > dom )
+			{
+				dom = ay;
+				off = (b3Vec3i){ 0, n.y > 0.0f ? 1 : -1, 0 };
+			}
+			if ( az > dom )
+			{
+				dom = az;
+				off = (b3Vec3i){ 0, 0, n.z > 0.0f ? 1 : -1 };
+			}
+			if ( dom > 0.9f &&
+				 b3VoxelData_IsSolid( v, (b3Vec3i){ cells[a].x + off.x, cells[a].y + off.y, cells[a].z + off.z } ) )
+			{
+				float minSep = FLT_MAX;
+				for ( int k = 0; k < m.pointCount; ++k )
+				{
+					minSep = b3MinFloat( minSep, m.points[k].separation );
+				}
+				if ( minSep >= -0.25f * vs )
+				{
+					continue; // shallow seam contact: neighboring cells provide support
+				}
+
+				float bestOverlap = FLT_MAX;
+				b3Vec3 bestDir = b3Vec3_zero;
+				for ( int axisIndex = 0; axisIndex < 3; ++axisIndex )
+				{
+					for ( int sign = -1; sign <= 1; sign += 2 )
+					{
+						b3Vec3i noff = { 0, 0, 0 };
+						( &noff.x )[axisIndex] = sign;
+						if ( b3VoxelData_IsSolid(
+								 v, (b3Vec3i){ cells[a].x + noff.x, cells[a].y + noff.y, cells[a].z + noff.z } ) )
+						{
+							continue; // blocked
+						}
+						float cellCoord = ( &center.x )[axisIndex];
+						float overlap = sign > 0 ? ( cellCoord + h ) - ( &lo.x )[axisIndex]
+												 : ( &hi.x )[axisIndex] - ( cellCoord - h );
+						if ( overlap > 0.0f && overlap < bestOverlap )
+						{
+							bestOverlap = overlap;
+							bestDir = (b3Vec3){ 0.0f, 0.0f, 0.0f };
+							( &bestDir.x )[axisIndex] = (float)sign;
+						}
+					}
+				}
+				if ( bestOverlap < FLT_MAX )
+				{
+					b3VoxelContact sub;
+					sub.normal = b3Neg( bestDir ); // convex -> cell, matching the SAT contacts
+					sub.initialPenetration = bestOverlap;
+					sub.penetrationDepth = contactDistance + bestOverlap; // closeness ranking, above any speculative point
+					b3Vec3 facePoint = center;
+					( &facePoint.x )[0] += bestDir.x * h;
+					( &facePoint.x )[1] += bestDir.y * h;
+					( &facePoint.x )[2] += bestDir.z * h;
+					sub.body0Point = facePoint;
+					sub.body1Point = facePoint;
+					sub.featureId = b3Voxel_cellId( cells[a] ) ^ 0x5bd1e995u;
+					b3Voxel_addReduced( &sub, out, &nacc, maxContacts );
+				}
+				continue;
+			}
+		}
+
 		uint32_t cellId = b3Voxel_cellId( cells[a] );
 		for ( int k = 0; k < m.pointCount; ++k )
 		{
@@ -341,7 +413,7 @@ static int b3VoxelCollideConvex( const b3VoxelData* v, const b3Shape* convex, b3
 			b3VoxelContact c;
 			c.normal = b3Neg( m.normal ); // cell -> convex (A -> B) flipped to B -> A
 			c.initialPenetration = -m.points[k].separation;
-			c.penetrationDepth = c.initialPenetration > 0.0f ? c.initialPenetration : 0.0f;
+			c.penetrationDepth = b3MaxFloat( contactDistance + c.initialPenetration, 0.0f );
 			c.body0Point = m.points[k].point;
 			c.body1Point = m.points[k].point;
 			c.featureId = cellId ^ ( b3MakeFeatureId( m.points[k].pair ) * 2654435761u );
@@ -352,13 +424,14 @@ static int b3VoxelCollideConvex( const b3VoxelData* v, const b3Shape* convex, b3
 }
 
 bool b3ComputeVoxelManifolds( b3World* world, int workerIndex, b3Contact* contact, const b3Shape* shapeA, b3WorldTransform xfA,
-							  const b3Shape* shapeB, b3WorldTransform xfB, b3Arena arena )
+							  const b3Shape* shapeB, b3WorldTransform xfB, float relMotion, b3Arena arena )
 {
 	B3_UNUSED( workerIndex );
 
 	b3Transform transformBtoA = b3InvMulWorldTransforms( xfA, xfB );
 
-	float contactDistance = ( contact->flags & b3_enableSpeculativePoints ) ? B3_SPECULATIVE_DISTANCE : B3_LINEAR_SLOP;
+	float contactDistance =
+		( contact->flags & b3_enableSpeculativePoints ) ? B3_SPECULATIVE_DISTANCE + relMotion : B3_LINEAR_SLOP;
 
 	b3VoxelContact contacts[B3_VOXEL_MAX_CONTACTS];
 	int count;

@@ -733,7 +733,7 @@ static bool b3UpdateConvexContact( b3World* world, int workerIndex, b3Contact* c
 // Note: do not assume the shape AABBs are overlapping or are valid.
 bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Shape* shapeA, b3Vec3 localCenterA,
 					  b3WorldTransform xfA, b3Shape* shapeB, b3Vec3 localCenterB, b3WorldTransform xfB, bool isFast,
-					  b3Arena arena )
+					  float relMotion, b3Arena arena )
 {
 	bool touching;
 
@@ -845,7 +845,7 @@ bool b3UpdateContact( b3World* world, int workerIndex, b3Contact* contact, b3Sha
 	}
 	else if ( shapeA->type == b3_voxelShape )
 	{
-		touching = b3ComputeVoxelManifolds( world, workerIndex, contact, shapeA, xfA, shapeB, xfB, arena );
+		touching = b3ComputeVoxelManifolds( world, workerIndex, contact, shapeA, xfA, shapeB, xfB, relMotion, arena );
 
 		if ( touching && ( ( shapeA->flags & b3_enableHitEvents ) || ( shapeB->flags & b3_enableHitEvents ) ) )
 		{

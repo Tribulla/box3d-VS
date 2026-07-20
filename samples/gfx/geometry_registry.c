@@ -11,7 +11,7 @@
 #include <string.h>
 
 #define MAX_REGISTRY_ENTRIES 4096
-#define MAX_GEOM_INSTANCES_GLOBAL 65536
+#define MAX_GEOM_INSTANCES_GLOBAL ( 1024 * 1024 )
 #define INITIAL_PER_ENTRY_CAPACITY 8
 
 typedef struct Entry
