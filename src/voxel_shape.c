@@ -449,6 +449,41 @@ int b3Voxel_QueryCells( const b3VoxelData* v, b3AABB queryLocal, b3Vec3i* out, i
 				if ( !b3Voxel_aabbIntersects( &chunk->solidBounds, &clip ) )
 					continue;
 				int base[3] = { cx << B3_VOXEL_CHUNK_BITS, cy << B3_VOXEL_CHUNK_BITS, cz << B3_VOXEL_CHUNK_BITS };
+
+				int lMinX = gMinX - 1 - base[0] > 0 ? gMinX - 1 - base[0] : 0;
+				int lMinY = gMinY - 1 - base[1] > 0 ? gMinY - 1 - base[1] : 0;
+				int lMinZ = gMinZ - 1 - base[2] > 0 ? gMinZ - 1 - base[2] : 0;
+				int lMaxX = gMaxX + 1 - base[0] < B3_VOXEL_CHUNK_MASK ? gMaxX + 1 - base[0] : B3_VOXEL_CHUNK_MASK;
+				int lMaxY = gMaxY + 1 - base[1] < B3_VOXEL_CHUNK_MASK ? gMaxY + 1 - base[1] : B3_VOXEL_CHUNK_MASK;
+				int lMaxZ = gMaxZ + 1 - base[2] < B3_VOXEL_CHUNK_MASK ? gMaxZ + 1 - base[2] : B3_VOXEL_CHUNK_MASK;
+				int rangeVolume = ( lMaxX - lMinX + 1 ) * ( lMaxY - lMinY + 1 ) * ( lMaxZ - lMinZ + 1 );
+
+				if ( rangeVolume < chunk->occupiedCount )
+				{
+					for ( int lz = lMinZ; lz <= lMaxZ; ++lz )
+					{
+						for ( int ly = lMinY; ly <= lMaxY; ++ly )
+						{
+							for ( int lx = lMinX; lx <= lMaxX; ++lx )
+							{
+								if ( !chunk->solid[b3Voxel_localIndex( lx, ly, lz )] )
+									continue;
+								b3Vec3i g = { base[0] + lx, base[1] + ly, base[2] + lz };
+								b3AABB cellBox = { { g.x * s - half, g.y * s - half, g.z * s - half },
+												   { g.x * s + half, g.y * s + half, g.z * s + half } };
+								if ( !b3Voxel_aabbIntersects( &cellBox, &clip ) )
+									continue;
+								if ( n < cap )
+									out[n] = g;
+								n++;
+								if ( n >= cap )
+									return cap;
+							}
+						}
+					}
+					continue;
+				}
+
 				for ( int k = 0; k < chunk->occupiedCount; ++k )
 				{
 					b3Vec3i lc = chunk->occupied[k];

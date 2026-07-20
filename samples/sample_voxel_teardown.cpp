@@ -15,6 +15,8 @@ public:
 		: VoxelSample( context )
 	{
 		m_vpm = m_isDebug ? 2 : 4;
+		if ( const char* e = getenv( "VOX_VPM" ) ) // headless perf runs at a chosen resolution
+			m_vpm = b3ClampInt( atoi( e ), 2, 8 );
 		m_voxel = 1.0f / (float)m_vpm;
 		m_groundExtent = 42.0f;
 		m_groundThick = 1; // a thin sheet keeps the static ground at ~100k cells, not ~400k

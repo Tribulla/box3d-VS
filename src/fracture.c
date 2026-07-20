@@ -240,6 +240,9 @@ typedef struct b3FracturePiece
 	uint8_t debris;
 	uint8_t merge;
 	uint8_t active;
+	uint8_t stressSettled;
+	b3WorldTransform settleXf; // body transform captured when the piece settled
+
 	uint8_t hostOwned;	 // 1 = wraps a host body's existing b3_voxelShape (analysis-only; host materialises fragments)
 	b3ShapeId hostShape; // the host b3_voxelShape to mutate in place on sever (hostOwned only)
 	b3Vec3i cellBias;	 // host pieces: shift body-LOCAL cells into a unique global cellToVox slot (0 for engine)
@@ -305,6 +308,8 @@ enum b3F_ScratchId
 
 	B3F_SC_PLIST, // parallel analysis: piece worklist (worker 0 only)
 	B3F_SC_PDEC,  // parallel analysis: per-piece decisions (worker 0 only)
+
+	B3F_SC_DECAYSKIP, // b3F_gatherContactForces: per-piece force-decay skip flags
 
 	B3F_SC_COUNT
 };
@@ -475,8 +480,7 @@ static int b3F_neighbor( b3FractureWorld* fw, int v, int f, int piece )
 	b3FractureVoxel* vx = b3F_vox( fw, v );
 	if ( ( vx->brokenFaces >> f ) & 1u )
 		return -1;
-	b3Vec3i nc = { vx->cell.x + FACE[f][0], vx->cell.y + FACE[f][1], vx->cell.z + FACE[f][2] };
-	int nv = b3F_mapGet( &fw->cellToVox, b3F_packCell( nc ) );
+	int nv = vx->nbr[f];
 	if ( nv >= 0 && b3F_vox( fw, nv )->piece == piece )
 		return nv;
 	return -1;
@@ -485,11 +489,17 @@ static int b3F_neighbor( b3FractureWorld* fw, int v, int f, int piece )
 static void b3F_sever( b3FractureWorld* fw, int v, int f )
 {
 	b3FractureVoxel* vx = b3F_vox( fw, v );
-	b3Vec3i nc = { vx->cell.x + FACE[f][0], vx->cell.y + FACE[f][1], vx->cell.z + FACE[f][2] };
-	int nv = b3F_mapGet( &fw->cellToVox, b3F_packCell( nc ) );
+	int nv = vx->nbr[f];
 	vx->brokenFaces |= (uint8_t)( 1u << f );
+	if ( vx->piece >= 0 )
+		fw->pieces.data[vx->piece].stressSettled = 0; // the bond graph changed
 	if ( nv >= 0 )
-		b3F_vox( fw, nv )->brokenFaces |= (uint8_t)( 1u << ( f ^ 1 ) );
+	{
+		b3FractureVoxel* nvx = b3F_vox( fw, nv );
+		nvx->brokenFaces |= (uint8_t)( 1u << ( f ^ 1 ) );
+		if ( nvx->piece >= 0 )
+			fw->pieces.data[nvx->piece].stressSettled = 0;
+	}
 }
 
 static int b3F_allocPiece( b3FractureWorld* fw )
@@ -556,6 +566,7 @@ static void b3F_formBody( b3FractureWorld* fw, int p, const int* voxels, int cou
 		P->debris = (uint8_t)debris;
 		P->merge = (uint8_t)merge;
 		P->active = 1;
+		P->stressSettled = 0;
 		P->peakApproach = 0.0f;
 		P->overloadStreak = 0;
 		for ( int i = 0; i < count; ++i )
@@ -593,6 +604,7 @@ static void b3F_formBody( b3FractureWorld* fw, int p, const int* voxels, int cou
 	P->debris = (uint8_t)debris;
 	P->merge = (uint8_t)merge;
 	P->active = 1;
+	P->stressSettled = 0;
 	P->peakApproach = 0.0f;
 	P->overloadStreak = 0;
 
@@ -763,6 +775,15 @@ static int b3F_addBody( b3FractureWorld* fw, const b3Vec3i* cells, int count, b3
 		b3Array_Push( fw->voxels, vx );
 		b3F_mapPut( &fw->cellToVox, key, id );
 		idx[kept++] = id;
+	}
+	for ( int i = 0; i < kept; ++i )
+	{
+		b3FractureVoxel* vx = b3F_vox( fw, idx[i] );
+		for ( int f = 0; f < 6; ++f )
+		{
+			b3Vec3i nc = { vx->cell.x + FACE[f][0], vx->cell.y + FACE[f][1], vx->cell.z + FACE[f][2] };
+			vx->nbr[f] = b3F_mapGet( &fw->cellToVox, b3F_packCell( nc ) );
+		}
 	}
 	if ( kept == 0 )
 	{
@@ -1144,6 +1165,7 @@ static void b3F_gatherPiece( b3FractureWorld* fw, int p, int worker, float invDt
 					P->peakApproach = -mp->normalVelocity;
 				if ( mp->totalNormalImpulse <= 0.0f )
 					continue;
+				P->stressSettled = 0; // a real contact force arrived: the stress state may change
 				float mag = mp->totalNormalImpulse * invDt;
 				b3Vec3 Ffull = b3MulSV( sign * mag, normal );
 				b3Vec3 anchor = weAreA ? mp->anchorA : mp->anchorB;
@@ -1193,8 +1215,29 @@ static void b3F_gatherTask( int startIndex, int endIndex, int workerIndex, void*
 
 static void b3F_gatherContactForces( b3World* world, b3FractureWorld* fw, float invDt )
 {
-	for ( int p = 0; p < fw->pieces.count; ++p )
-		fw->pieces.data[p].peakApproach = 0.0f;
+	int pieceCount = fw->pieces.count;
+	char* skipDecay = (char*)b3F_scratch( fw, B3F_SC_DECAYSKIP, (size_t)( pieceCount > 0 ? pieceCount : 1 ) );
+	bool anyDecay = false;
+	for ( int p = 0; p < pieceCount; ++p )
+	{
+		b3FracturePiece* P = fw->pieces.data + p;
+		P->peakApproach = 0.0f;
+
+		if ( P->active && P->stressSettled && ( ( fw->frame + p ) & 15 ) == 0 )
+		{
+			b3WorldTransform xf = b3Body_GetTransform( P->body );
+			if ( xf.p.x != P->settleXf.p.x || xf.p.y != P->settleXf.p.y || xf.p.z != P->settleXf.p.z ||
+				 xf.q.v.x != P->settleXf.q.v.x || xf.q.v.y != P->settleXf.q.v.y || xf.q.v.z != P->settleXf.q.v.z ||
+				 xf.q.s != P->settleXf.q.s )
+			{
+				P->stressSettled = 0;
+			}
+		}
+
+		char skip = ( char )( !P->active || P->stressSettled || ( P->isStatic == 0 && b3Body_IsAwake( P->body ) == false ) );
+		skipDecay[p] = skip;
+		anyDecay |= !skip;
+	}
 
 	bool contactStress = fw->tuning.contactStress;
 	float a = fw->tuning.contactSmoothing;
@@ -1202,26 +1245,29 @@ static void b3F_gatherContactForces( b3World* world, b3FractureWorld* fw, float 
 		a = 1.0f;
 	float forceKeep = contactStress ? ( 1.0f - a ) : 0.0f;
 
-	for ( int v = 0; v < fw->voxels.count; ++v )
+	if ( anyDecay )
 	{
-		b3FractureVoxel* vx = fw->voxels.data + v;
-		if ( vx->piece < 0 )
-			continue;
-		if ( vx->restOnAge > 0 )
-			vx->restOnAge--;
-		if ( vx->restOnAge == 0 )
-			vx->restOn = -1;
-		vx->forceRaw = b3Vec3_zero;
-		vx->force = b3MulSV( forceKeep, vx->force );
-	}
-	for ( int c = 0; c < fw->chunks.count; ++c )
-	{
-		b3F_Chunk* ch = fw->chunks.data + c;
-		if ( ch->piece < 0 )
-			continue;
-		ch->restOn = -1;
-		ch->forceRaw = b3Vec3_zero;
-		ch->force = b3MulSV( forceKeep, ch->force );
+		for ( int v = 0; v < fw->voxels.count; ++v )
+		{
+			b3FractureVoxel* vx = fw->voxels.data + v;
+			if ( vx->piece < 0 || skipDecay[vx->piece] )
+				continue;
+			if ( vx->restOnAge > 0 )
+				vx->restOnAge--;
+			if ( vx->restOnAge == 0 )
+				vx->restOn = -1;
+			vx->forceRaw = b3Vec3_zero;
+			vx->force = b3MulSV( forceKeep, vx->force );
+		}
+		for ( int c = 0; c < fw->chunks.count; ++c )
+		{
+			b3F_Chunk* ch = fw->chunks.data + c;
+			if ( ch->piece < 0 || skipDecay[ch->piece] )
+				continue;
+			ch->restOn = -1;
+			ch->forceRaw = b3Vec3_zero;
+			ch->force = b3MulSV( forceKeep, ch->force );
+		}
 	}
 	if ( !contactStress )
 		return;
@@ -1316,11 +1362,10 @@ static bool b3F_impactFracture( b3FractureWorld* fw, int piece )
 		int v = voxbuf[i];
 		if ( !isSite[v] )
 			continue;
+		b3FractureVoxel* vx = b3F_vox( fw, v );
 		for ( int f = 0; f < 6; ++f )
 		{
-			b3FractureVoxel* vx = b3F_vox( fw, v );
-			b3Vec3i nc = { vx->cell.x + FACE[f][0], vx->cell.y + FACE[f][1], vx->cell.z + FACE[f][2] };
-			int nv = b3F_mapGet( &fw->cellToVox, b3F_packCell( nc ) );
+			int nv = vx->nbr[f];
 			if ( nv >= 0 && b3F_vox( fw, nv )->piece == piece && !isSite[nv] )
 			{
 				b3F_sever( fw, v, f );
@@ -1366,8 +1411,7 @@ static int b3F_sectionBonds( b3FractureWorld* fw, const int* vox, int count, int
 		int face = ( axis << 1 ); // +axis face index (0,2,4)
 		if ( ( vx->brokenFaces >> face ) & 1u )
 			continue;
-		b3Vec3i nc = { vx->cell.x + off[0], vx->cell.y + off[1], vx->cell.z + off[2] };
-		int nv = b3F_mapGet( &fw->cellToVox, b3F_packCell( nc ) );
+		int nv = vx->nbr[face];
 		if ( nv < 0 || b3F_vox( fw, nv )->piece != vx->piece )
 			continue;
 		b3Vec3 pv = b3F_worldPosLocal( xf, vx->local );
@@ -1438,10 +1482,31 @@ static bool b3F_analysisEligible( const b3FractureWorld* fw, const b3FracturePie
 	return ls < fw->tuning.settleSpeed && as < fw->tuning.settleSpeed;
 }
 
+static void b3F_trySettle( b3FractureWorld* fw, b3FracturePiece* P, float maxForce2 )
+{
+	b3FractureVoxel* v0 = b3F_vox( fw, P->voxels.data[0] );
+	float eps = 1e-3f * fw->materials.data[v0->mat].strength * fw->tuning.strengthScale * fw->voxel * fw->voxel;
+	if ( eps <= 0.0f || maxForce2 > eps * eps )
+		return;
+	P->stressSettled = 1;
+	P->settleXf = b3Body_GetTransform( P->body );
+	for ( int i = 0; i < P->voxels.count; ++i )
+	{
+		b3FractureVoxel* vx = b3F_vox( fw, P->voxels.data[i] );
+		vx->force = b3Vec3_zero;
+		vx->forceRaw = b3Vec3_zero;
+		vx->stressShown = vx->stress; // converge the display now; it will not be revisited
+		vx->restOn = -1;
+		vx->restOnAge = 0;
+	}
+}
+
 static void b3F_analyzePiece( b3FractureWorld* fw, int worker, int piece, bool doFracture, b3F_Decision* dec )
 {
 	b3FracturePiece* P = fw->pieces.data + piece;
 	dec->fracture = false;
+	if ( P->stressSettled )
+		return; // the last analysis stands; every input is unchanged since
 	int nv = P->voxels.count;
 	for ( int i = 0; i < nv; ++i )
 	{
@@ -1465,6 +1530,7 @@ static void b3F_analyzePiece( b3FractureWorld* fw, int worker, int piece, bool d
 	b3Vec3* fext = (b3Vec3*)b3F_scratchW( fw, worker, B3F_SC_V_FEXT, (size_t)nv * sizeof( b3Vec3 ) );
 	char* support = (char*)b3F_scratchW( fw, worker, B3F_SC_V_SUPPORT, (size_t)nv );
 
+	float maxForce2 = 0.0f; // residual contact force, for the settle test below
 	for ( int i = 0; i < nv; ++i )
 	{
 		b3FractureVoxel* vx = b3F_vox( fw, vox[i] );
@@ -1472,6 +1538,7 @@ static void b3F_analyzePiece( b3FractureWorld* fw, int worker, int piece, bool d
 		float m = b3F_voxelMass( fw, vox[i] );
 		mass[i] = m;
 		b3Vec3 load = vx->force;
+		maxForce2 = b3F_max( maxForce2, b3Dot( load, load ) );
 		float upc = b3Dot( load, up );
 		if ( upc > 0.0f )
 			load = b3MulSub( load, upc, up );
@@ -1549,7 +1616,11 @@ static void b3F_analyzePiece( b3FractureWorld* fw, int worker, int piece, bool d
 	}
 
 	if ( nsup == 0 || nsup == nv )
+	{
+		if ( P->isStatic && nsup == nv && spanCount == 0 )
+			b3F_trySettle( fw, P, maxForce2 );
 		return;
+	}
 	{
 		bool span = !fixedSupport && spanCount >= 2;
 
@@ -1886,6 +1957,10 @@ static void b3F_analyzePiece( b3FractureWorld* fw, int worker, int piece, bool d
 			P->overloadStreak += b3F_stride( fw ); // one analysis stands in for K frames of overload
 		else
 			P->overloadStreak = 0;
+
+		if ( P->isStatic && bestAxis < 0 && spanCount == 0 )
+			b3F_trySettle( fw, P, maxForce2 );
+
 		bool impactNow = P->peakApproach > fw->tuning.impactSpeed;
 		bool sustained = fw->tuning.stressEnabled && P->overloadStreak >= fw->tuning.fractureHoldFrames;
 
@@ -1929,8 +2004,7 @@ static void b3F_severVoxelPiece( b3FractureWorld* fw, int piece, const b3F_Decis
 		bool lv = b3F_iaxis( c, axis ) <= b + ov;
 		for ( int f = 0; f < 6; ++f )
 		{
-			int nvid = b3F_mapGet( &fw->cellToVox, b3F_packCell( (b3Vec3i){ c.x + FACE[f][0], c.y + FACE[f][1],
-																			   c.z + FACE[f][2] } ) );
+			int nvid = vx->nbr[f];
 			if ( nvid < 0 || b3F_vox( fw, nvid )->piece != piece )
 				continue;
 			b3Vec3i nc = b3F_vox( fw, nvid )->cell;
@@ -2301,6 +2375,7 @@ static void b3F_formChunkBody( b3FractureWorld* fw, int piece, const int* chunkI
 	P->debris = 0;
 	P->merge = 0;
 	P->active = 1;
+	P->stressSettled = 0;
 	P->peakApproach = 0.0f;
 	P->overloadStreak = 0;
 }
@@ -2488,6 +2563,11 @@ void b3FractureWorld_Step( b3World* world, float dt )
 	if ( fw == NULL )
 		return;
 	fw->frame++;
+	if ( fw->gravity.x != world->gravity.x || fw->gravity.y != world->gravity.y || fw->gravity.z != world->gravity.z )
+	{
+		for ( int p = 0; p < fw->pieces.count; ++p )
+			fw->pieces.data[p].stressSettled = 0;
+	}
 	fw->gravity = world->gravity;
 	fw->profSeverMs = 0.0f;
 
@@ -3140,7 +3220,15 @@ void b3World_EnableFracture( b3WorldId worldId, float voxel, float groundY )
 	b3World* world = b3GetWorldFromId( worldId );
 	B3_ASSERT( world != NULL );
 	b3FractureWorld* fw = b3F_getOrCreate( world, worldId, voxel > 0.0f ? voxel : 1.0f, groundY );
-	fw->voxel = voxel > 0.0f ? voxel : 1.0f;
+	float newVoxel = voxel > 0.0f ? voxel : 1.0f;
+
+	if ( fw->voxel != newVoxel || fw->groundY != groundY )
+	{
+		for ( int p = 0; p < fw->pieces.count; ++p )
+			fw->pieces.data[p].stressSettled = 0;
+	}
+
+	fw->voxel = newVoxel;
 	fw->radius = 0.5f * fw->voxel;
 	fw->groundY = groundY;
 }
@@ -3156,7 +3244,11 @@ void b3World_SetFractureTuning( b3WorldId worldId, b3FractureTuning tuning )
 	b3World* world = b3GetWorldFromId( worldId );
 	if ( world == NULL || world->fractureWorld == NULL )
 		return;
-	( (b3FractureWorld*)world->fractureWorld )->tuning = tuning;
+	b3FractureWorld* fw = (b3FractureWorld*)world->fractureWorld;
+	fw->tuning = tuning;
+
+	for ( int p = 0; p < fw->pieces.count; ++p )
+		fw->pieces.data[p].stressSettled = 0;
 }
 
 b3FractureTuning b3World_GetFractureTuning( b3WorldId worldId )
@@ -3362,6 +3454,15 @@ static int b3F_addHostVoxelBody( b3FractureWorld* fw, b3BodyId bodyId, b3ShapeId
 		b3F_mapPut( &fw->cellToVox, key, id );
 		idx[kept++] = id;
 	}
+	for ( int i = 0; i < kept; ++i )
+	{
+		b3FractureVoxel* vx = b3F_vox( fw, idx[i] );
+		for ( int f = 0; f < 6; ++f )
+		{
+			b3Vec3i nc = { vx->cell.x + FACE[f][0], vx->cell.y + FACE[f][1], vx->cell.z + FACE[f][2] };
+			vx->nbr[f] = b3F_mapGet( &fw->cellToVox, b3F_packCell( nc ) );
+		}
+	}
 	if ( kept == 0 )
 	{
 		b3Free( idx, (size_t)count * sizeof( int ) );
@@ -3381,6 +3482,7 @@ static int b3F_addHostVoxelBody( b3FractureWorld* fw, b3BodyId bodyId, b3ShapeId
 	P->hostShape = shapeId;
 	P->cellBias = bias;
 	P->active = 1;
+	P->stressSettled = 0;
 	P->peakApproach = 0.0f;
 	P->overloadStreak = 0;
 	for ( int i = 0; i < kept; ++i )
